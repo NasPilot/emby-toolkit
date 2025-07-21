@@ -18,19 +18,18 @@ RUN npm run build
 # --- 阶段 2: 构建最终的生产镜像 ---
 FROM python:3.11-slim
 
-# ✨ 1. 接收从 Unraid (或 docker-compose) 传来的环境变量，并设置默认值 ✨
+# ✨ 1. 接收从 Unraid/群晖 传来的环境变量，并设置默认值 ✨
 ARG PUID=1000
 ARG PGID=100
+ARG UMASK=022
 
 WORKDIR /app
 
 # 安装必要的系统依赖和 Node.js
 RUN apt-get update && \
-    # ... (安装 nodejs 的部分) ...
-    apt-get install -y nodejs && \
-    # ✨✨✨ START: 决定性的修复 ✨✨✨
+    apt-get install -y nodejs gosu && \
+    # ✨✨✨ START: 群晖兼容的权限修复 ✨✨✨
     # 1. 检查目标 PUID 是否已被占用，如果被占用，就删除那个用户
-    #    我们用 `getent passwd ${PUID}` 来查找，如果找到了，第一列就是用户名
     if getent passwd ${PUID} > /dev/null; then \
         echo "User with PUID ${PUID} already exists, deleting it."; \
         EXISTING_USER=$(getent passwd ${PUID} | cut -d: -f1); \
@@ -42,10 +41,10 @@ RUN apt-get update && \
         EXISTING_GROUP=$(getent group ${PGID} | cut -d: -f1); \
         delgroup $EXISTING_GROUP; \
     fi && \
-    # 3. 现在可以安全地创建我们自己的用户和组了
-    groupadd -g ${PGID} myuser && \
-    useradd -u ${PUID} -g myuser -s /bin/sh -m myuser && \
-    # ✨✨✨ END: 决定性的修复 ✨✨✨
+    # 3. 创建用户和组，确保与群晖系统兼容
+    groupadd -g ${PGID} appuser && \
+    useradd -u ${PUID} -g appuser -s /bin/bash -m appuser && \
+    # ✨✨✨ END: 群晖兼容的权限修复 ✨✨✨
     # 清理 apt 缓存
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -73,16 +72,18 @@ COPY templates/ ./templates/
 # 从前端构建阶段拷贝编译好的静态文件
 COPY --from=frontend-build /app/emby-actor-ui/dist/. /app/static/
 
-# ✨ 3. 声明 /config 和 /app 目录，并确保新用户有权访问它们 ✨
+# ✨ 3. 设置默认环境变量和声明 /config 目录 ✨
+# 设置默认数据目录环境变量
+ENV APP_DATA_DIR=/config
+
 # /config 是你挂载的持久化数据目录
 VOLUME /config
-# 确保新创建的用户对应用目录有所有权
-RUN chown -R myuser:myuser /app
 
-# ✨ 4. 切换到这个新创建的非 root 用户 ✨
-USER myuser
+# 复制启动脚本
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-EXPOSE 5257 
+EXPOSE 5257
 
-# ✨ 5. 用这个非 root 用户的身份来启动应用 ✨
-CMD ["python", "web_app.py"]
+# ✨ 4. 使用启动脚本来处理权限和启动应用 ✨
+ENTRYPOINT ["/entrypoint.sh"]

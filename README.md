@@ -1,7 +1,7 @@
 # Emby Actor Processor (Emby 演员管理工具)
 
-[![GitHub stars](https://img.shields.io/github/stars/hbq0405/emby-actor-processor.svg?style=social&label=Star)](https://github.com/hbq0405/emby-actor-processor)
-[![GitHub license](https://img.shields.io/github/license/hbq0405/emby-actor-processor.svg)](https://github.com/hbq0405/emby-actor-processor/blob/main/LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/NasPilot/emby-actor-processor.svg?style=social&label=Star)](https://github.com/NasPilot/emby-actor-processor)
+[![GitHub license](https://img.shields.io/github/license/NasPilot/emby-actor-processor.svg)](https://github.com/NasPilot/emby-actor-processor/blob/main/LICENSE)
 <!-- 你可以添加更多的徽章，例如构建状态、Docker Hub 拉取次数等 -->
 
 一个用于处理和增强 Emby 媒体库中演员信息的工具，包括但不限于演员名称翻译、信息补全（从豆瓣、TMDb等）、以及演员映射管理。
@@ -20,6 +20,8 @@
 
 ## 🚀 快速开始
 
+**⚡ 想要立即开始？** 查看我们的 [快速开始指南](QUICK_START.md)，几分钟内完成部署！
+
 ### 先决条件
 
 *   已安装 Docker 和 Docker Compose (推荐)。
@@ -28,57 +30,139 @@
 
 ### Docker 部署 (推荐)
 
-这是最简单和推荐的部署方式。
+这是最简单和推荐的部署方式。我们提供了多种部署选项：
 
-1.  **准备持久化数据目录**：
-    在你的服务器上（例如 NAS）创建一个目录，用于存放应用的配置文件和数据库。例如：
+#### 🚀 一键部署脚本 (最简单)
+
+我们提供了智能一键部署脚本，可以自动检测系统类型并选择合适的配置：
+
+```bash
+# 下载项目
+git clone https://github.com/NasPilot/emby-actor-processor.git
+cd emby-actor-processor
+
+# 一键部署
+./deploy.sh
+```
+
+**脚本功能：**
+- 自动检测系统类型（通用 Linux 或群晖 NAS）
+- 自动创建数据目录并设置正确权限
+- 拉取最新镜像并启动容器
+- 提供详细的部署状态和访问信息
+
+**高级选项：**
+```bash
+./deploy.sh -h                    # 查看帮助
+./deploy.sh -d /custom/path       # 指定数据目录
+./deploy.sh -s synology           # 强制使用群晖配置
+./deploy.sh --no-pull --no-start  # 只准备环境，不启动
+```
+
+#### 📋 手动 Docker Compose 部署
+
+如果需要更多控制，可以使用预配置的 Docker Compose 文件：
+
+- **`docker-compose.yml`** - 通用版本，适用于大多数 Linux 系统
+- **`docker-compose.synology.yml`** - 群晖专用版本，解决权限问题
+
+#### 通用部署（推荐）
+
+适用于 Ubuntu、CentOS、Debian 等标准 Linux 系统。
+
+1.  **准备数据目录**：
     ```bash
-    mkdir -p /path/app_data/emby_actor_processor_config
+    mkdir -p ./data
+    # 确保目录权限正确
+    sudo chown -R $USER:$USER ./data
     ```
-    请将 `/path/app_data/emby_actor_processor_config` 替换为你实际的路径。
 
-2.  **使用 `docker-compose.yml` (推荐)**：
-    创建一个 `docker-compose.yml` 文件，内容如下：
-
-    ```yaml
-    version: '3.8'
-
-    services:
-      emby-actor-processor:
-        image: hbq0405/emby-actor-processor:latest 
-        container_name: emby-actor-processor
-        ports:
-          - "5257:5257"          #  将容器的 5257 端口映射到宿主机的 5257 端口 (左边可以改成你希望的宿主机端口)
-        volumes:
-          - /path/app:/config    #  将宿主机的数据目录挂载到容器的 /config 目录
-          - /path/tmdb:/tmdb     #  映射神医本地TMDB目录，必须配置。
-        environment:
-          - APP_DATA_DIR=/config #  告诉应用数据存储在 /config 目录
-          - TZ=Asia/Shanghai     # (可选) 设置容器时区，例如亚洲/上海
-          - AUTH_USERNAME=admin  #  用户名可任意设置，密码在程序首次运行会生成随机密码打印在日志中
-          - PUID=0               #  保持和emby相同配置 出现权限问题，可以试试用UID
-          - PGID=0               #  保持和emby相同配置 出现权限问题，可以试试用GID
-          - UMASK=000            #  保持和emby相同配置
-        restart: unless-stopped
-    ```
-    然后在 `docker-compose.yml` 文件所在的目录下运行：
+2.  **使用标准配置文件**：
     ```bash
+    # 下载或使用项目中的 docker-compose.yml
     docker-compose up -d
     ```
 
-3.  **或者使用 `docker run` 命令**：
-    ```bash
-    docker run -d \
-      --name emby-actor-processor \
-      -p 5257:5257 \
-      -v /path/app_data/emby_actor_processor_config:/config \
-      -v /path/cache:/cache \
-      -e APP_DATA_DIR="/config" \
-      -e TZ="Asia/Shanghai" \
-      --restart unless-stopped \
-      hbq0405/emby-actor-processor:latest
-    ```
-    同样，请替换占位符。
+3.  **自定义配置**：
+    根据需要修改 `docker-compose.yml` 中的以下配置：
+    - `PUID` 和 `PGID`：使用 `id` 命令查看你的用户 ID
+    - `volumes`：调整数据目录路径
+    - `TZ`：设置你的时区
+
+#### 群晖 NAS 部署
+
+群晖系统用户请使用专用配置文件：
+
+```bash
+# 使用群晖专用配置
+docker-compose -f docker-compose.synology.yml up -d
+```
+
+详细的群晖部署说明请参考：[群晖部署指南](SYNOLOGY_SETUP.md)
+
+#### 手动 Docker 命令部署
+
+如果不使用 Docker Compose，也可以直接使用 docker run 命令：
+
+**通用系统：**
+```bash
+docker run -d \
+  --name emby-actor-processor \
+  -p 5257:5257 \
+  -v ./data:/config \
+  -e PUID=1000 \
+  -e PGID=1000 \
+  -e UMASK=022 \
+  -e TZ=Asia/Shanghai \
+  -e AUTH_USERNAME=admin \
+  --restart unless-stopped \
+  NasPilot/emby-actor-processor:latest
+```
+
+**群晖系统：**
+```bash
+docker run -d \
+  --name emby-actor-processor \
+  -p 5257:5257 \
+  -v /volume1/docker/emby-actor-processor:/config \
+  -e PUID=1026 \
+  -e PGID=100 \
+  -e UMASK=022 \
+  -e TZ=Asia/Shanghai \
+  -e AUTH_USERNAME=admin \
+  --restart unless-stopped \
+  NasPilot/emby-actor-processor:latest
+```
+
+#### 环境变量说明
+
+| 变量名 | 默认值 | 说明 |
+|--------|--------|------|
+| PUID | 1000 | 用户 ID（群晖系统建议设置为 1026）|
+| PGID | 1000 | 组 ID（群晖系统建议设置为 100）|
+| UMASK | 022 | 文件权限掩码 |
+| TZ | Asia/Shanghai | 时区设置 |
+| AUTH_USERNAME | admin | Web 界面登录用户名 |
+| APP_DATA_DIR | /config | 数据目录（已在镜像中预设）|
+
+#### 网络模式配置
+
+两个 compose 文件都支持灵活的网络模式配置：
+
+- **bridge 模式**（默认推荐）：使用端口映射，更安全，避免端口冲突
+- **host 模式**：直接使用宿主机网络，性能更好但可能有端口冲突
+
+修改 `network_mode` 参数即可切换：
+```yaml
+# Bridge 模式（推荐）
+network_mode: bridge
+ports:
+  - "5257:5257"
+
+# Host 模式（高性能）
+network_mode: host
+# 注意：host 模式下不需要 ports 配置
+```
 
 4.  **首次配置**：
     *   通过容器启动日志查找随机生成的密码

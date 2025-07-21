@@ -1,0 +1,70 @@
+# Docker Compose 配置文件 - 通用版本
+# 适用于各种 Linux 系统和 Docker 环境
+
+version: '3.8'
+
+services:
+  emby-actor-processor:
+    # 使用预构建的镜像
+    image: NasPilot/emby-actor-processor:latest
+    
+    # 如果需要本地构建，取消注释下面一行并注释上面的 image 行
+    # build: .
+    
+    container_name: emby-actor-processor
+    
+    # 环境变量配置
+    environment:
+      # 用户和组 ID 配置（根据你的系统调整）
+      - PUID=1000             # 当前用户的 UID（使用 id -u 查看）
+      - PGID=1000             # 当前用户的 GID（使用 id -g 查看）
+      - UMASK=022             # 文件权限掩码
+      - TZ=Asia/Shanghai      # 时区设置（根据需要调整）
+      - AUTH_USERNAME=admin   # Web 界面登录用户名
+      # APP_DATA_DIR=/config  # 数据目录（已在镜像中预设）
+    
+    # 网络模式配置
+    # bridge: 默认模式，使用端口映射，更安全
+    # host: 直接使用宿主机网络，性能更好但可能有端口冲突
+    network_mode: bridge
+    
+    # 端口映射（仅在 bridge 模式下需要）
+    ports:
+      - "5257:5257"
+    
+    # 数据卷挂载
+    volumes:
+      # 配置和数据目录 - 请根据你的系统路径调整
+      - ./data:/config
+      # 或者使用绝对路径：
+      # - /home/user/emby-actor-processor:/config
+      
+      # 如果需要访问 Emby 的本地数据（可选）
+      # - /path/to/emby/metadata:/emby-data:ro
+    
+    # 重启策略
+    restart: unless-stopped
+    
+    # 健康检查（可选）
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5257/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+# 如果需要自定义网络（可选）
+# networks:
+#   emby-network:
+#     driver: bridge
+
+# 使用说明：
+# 1. 首次使用前，请创建数据目录：mkdir -p ./data
+# 2. 确保数据目录有正确的权限：sudo chown -R $USER:$USER ./data
+# 3. 根据你的系统调整 PUID 和 PGID（使用 id 命令查看）
+# 4. 启动服务：docker-compose up -d
+# 5. 查看日志：docker-compose logs -f
+# 6. 停止服务：docker-compose down
+#
+# 群晖用户请使用 docker-compose.synology.yml 文件
+# 其他 NAS 系统用户请根据需要调整 PUID/PGID 值

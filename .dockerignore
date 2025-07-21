@@ -45,8 +45,23 @@ Thumbs.db
 # (这些文件应该通过卷挂载到容器中，而不是构建进镜像里)
 # ----------------------------------------------------------------
 local_data/
+config/
 *.sqlite
 *.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
 config.ini
 secrets.env
 *.log
+logs/
+
+# ----------------------------------------------------------------
+# Documentation & Deployment Files
+# ----------------------------------------------------------------
+*.md
+README*
+CHANGELOG*
+LICENSE*
+docker-compose*.yml
+!Dockerfile
+SYNOLOGY_SETUP.md
