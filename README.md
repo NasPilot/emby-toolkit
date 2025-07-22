@@ -33,32 +33,32 @@
 1.  **准备持久化数据目录**：
     在你的服务器上（例如 NAS）创建一个目录，用于存放应用的配置文件和数据库。例如：
     ```bash
-    mkdir -p /path/app_data/emby_actor_processor_config
+    mkdir -p /path/app_data/emby_actor_processor/config
     ```
-    请将 `/path/app_data/emby_actor_processor_config` 替换为你实际的路径。
+    请将 `/path/app_data/emby_actor_processor/config` 替换为你实际的路径。
 
 2.  **使用 `docker-compose.yml` (推荐)**：
     创建一个 `docker-compose.yml` 文件，内容如下：
 
     ```yaml
-    version: '3.8'
+    version: '3'
 
     services:
       emby-actor-processor:
         image: hbq0405/emby-actor-processor:latest 
         container_name: emby-actor-processor
+        network_mode: bridge
         ports:
-          - "5257:5257"          #  将容器的 5257 端口映射到宿主机的 5257 端口 (左边可以改成你希望的宿主机端口)
+          - "5257:5257"              # 将容器的 5257 端口映射到宿主机的 5257 端口 (左边可以改成你希望的宿主机端口)
         volumes:
-          - /path/app:/config    #  将宿主机的数据目录挂载到容器的 /config 目录
-          - /path/tmdb:/tmdb     #  映射神医本地TMDB目录，必须配置。
+          - /path/config:/config     # 将宿主机的数据目录挂载到容器的 /config 目录
+          - /path/tmdb:/tmdb         # 映射神医本地TMDB目录，必须配置
         environment:
-          - APP_DATA_DIR=/config #  告诉应用数据存储在 /config 目录
-          - TZ=Asia/Shanghai     # (可选) 设置容器时区，例如亚洲/上海
-          - AUTH_USERNAME=admin  #  用户名可任意设置，密码在程序首次运行会生成随机密码打印在日志中
-          - PUID=0               #  保持和emby相同配置 出现权限问题，可以试试用UID
-          - PGID=0               #  保持和emby相同配置 出现权限问题，可以试试用GID
-          - UMASK=000            #  保持和emby相同配置
+          - TZ=Asia/Shanghai         # 设置容器时区
+          - AUTH_USERNAME=admin      # 用户名可任意设置，密码在程序首次运行会生成随机密码打印在日志中
+          - PUID=0                   # 设置为您的用户ID，建议与宿主机用户ID保持一致
+          - PGID=0                   # 设置为您的组ID，建议与宿主机组ID保持一致
+          - UMASK=000                # 设置文件权限掩码，建议022
         restart: unless-stopped
     ```
     然后在 `docker-compose.yml` 文件所在的目录下运行：
@@ -70,11 +70,15 @@
     ```bash
     docker run -d \
       --name emby-actor-processor \
+      --network bridge \
       -p 5257:5257 \
-      -v /path/app_data/emby_actor_processor_config:/config \
-      -v /path/cache:/cache \
-      -e APP_DATA_DIR="/config" \
+      -v /path/config:/config \
+      -v /path/tmdb:/tmdb \
       -e TZ="Asia/Shanghai" \
+      -e AUTH_USERNAME="admin" \
+      -e PUID=0 \
+      -e PGID=0 \
+      -e UMASK=000 \
       --restart unless-stopped \
       hbq0405/emby-actor-processor:latest
     ```
@@ -98,6 +102,32 @@
     *   要处理的媒体库
 *   **通用设置**:
     *   基础设置
+
+## 🔒 用户权限管理
+
+本应用采用了创建专用的非root用户权限管理机制，确保容器内的应用以非root用户运行，同时保持对挂载卷的正确访问权限。
+
+### 环境变量说明
+
+*   **PUID**：用户ID，建议设置为宿主机上拥有媒体文件访问权限的用户ID
+*   **PGID**：组ID，建议设置为宿主机上拥有媒体文件访问权限的组ID
+*   **UMASK**：文件权限掩码，控制新创建文件的权限，建议022表示新文件权限为755(目录)和644(文件)
+*   **APP_DATA_DIR**：应用数据目录，已在镜像中默认设置为`/config`，无需在运行时重复指定
+
+### 工作原理
+
+1. 容器内创建了一个固定UID/GID为918的`embyactor`用户
+2. 启动时，entrypoint.sh脚本会根据环境变量PUID和PGID动态修改`embyactor`用户的UID和GID
+3. 应用以`embyactor`用户身份运行，而不是root用户
+4. 所有挂载的卷和应用目录的所有权会被更改为`embyactor`用户
+
+### 权限问题排查
+
+如果遇到权限问题，请尝试以下步骤：
+
+1. 确认PUID和PGID设置正确，可以通过在宿主机上运行`id`命令查看当前用户的UID和GID
+2. 检查挂载目录的权限，确保指定的PUID/PGID用户有权访问
+3. 如果使用NAS或特殊文件系统，可能需要调整UMASK值，例如使用000以允许最大权限
     *   翻译设置
     *   本地数据源路径 (神医Pro版本地TMDB目录)
 *   **定时任务配置**:

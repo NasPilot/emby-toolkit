@@ -18,36 +18,37 @@ RUN npm run build
 # --- 阶段 2: 构建最终的生产镜像 ---
 FROM python:3.11-slim
 
-# ✨ 1. 接收从 Unraid (或 docker-compose) 传来的环境变量，并设置默认值 ✨
-ARG PUID=1000
-ARG PGID=100
+# 设置环境变量
+ENV LANG="C.UTF-8" \
+    TZ="Asia/Shanghai" \
+    HOME="/embyactor" \
+    CONFIG_DIR="/config" \
+    APP_DATA_DIR="/config" \
+    TERM="xterm" \
+    PUID=0 \
+    PGID=0 \
+    UMASK=000
 
 WORKDIR /app
 
 # 安装必要的系统依赖和 Node.js
 RUN apt-get update && \
-    # ... (安装 nodejs 的部分) ...
-    apt-get install -y nodejs && \
-    # ✨✨✨ START: 决定性的修复 ✨✨✨
-    # 1. 检查目标 PUID 是否已被占用，如果被占用，就删除那个用户
-    #    我们用 `getent passwd ${PUID}` 来查找，如果找到了，第一列就是用户名
-    if getent passwd ${PUID} > /dev/null; then \
-        echo "User with PUID ${PUID} already exists, deleting it."; \
-        EXISTING_USER=$(getent passwd ${PUID} | cut -d: -f1); \
-        deluser $EXISTING_USER; \
-    fi && \
-    # 2. 检查目标 PGID 是否已被占用，如果被占用，就删除那个组
-    if getent group ${PGID} > /dev/null; then \
-        echo "Group with PGID ${PGID} already exists, deleting it."; \
-        EXISTING_GROUP=$(getent group ${PGID} | cut -d: -f1); \
-        delgroup $EXISTING_GROUP; \
-    fi && \
-    # 3. 现在可以安全地创建我们自己的用户和组了
-    groupadd -g ${PGID} myuser && \
-    useradd -u ${PUID} -g myuser -s /bin/sh -m myuser && \
-    # ✨✨✨ END: 决定性的修复 ✨✨✨
-    # 清理 apt 缓存
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    apt-get upgrade -y && \
+    apt-get install -y \
+        nodejs \
+        gettext-base \
+        locales \
+        procps \
+        gosu \
+        bash \
+        wget \
+        curl \
+        dumb-init && \
+    apt-get clean && \
+    rm -rf \
+        /tmp/* \
+        /var/lib/apt/lists/* \
+        /var/tmp/*
 
 # 安装 Python 依赖
 COPY requirements.txt .
@@ -73,16 +74,19 @@ COPY templates/ ./templates/
 # 从前端构建阶段拷贝编译好的静态文件
 COPY --from=frontend-build /app/emby-actor-ui/dist/. /app/static/
 
-# ✨ 3. 声明 /config 和 /app 目录，并确保新用户有权访问它们 ✨
-# /config 是你挂载的持久化数据目录
-VOLUME /config
-# 确保新创建的用户对应用目录有所有权
-RUN chown -R myuser:myuser /app
+# 复制入口点脚本
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-# ✨ 4. 切换到这个新创建的非 root 用户 ✨
-USER myuser
+# 创建用户和组
+RUN mkdir -p ${HOME} && \
+    groupadd -r embyactor -g 918 && \
+    useradd -r embyactor -g embyactor -d ${HOME} -s /bin/bash -u 918
 
-EXPOSE 5257 
+# 声明 /config 目录为数据卷
+VOLUME [ "${CONFIG_DIR}" ]
 
-# ✨ 5. 用这个非 root 用户的身份来启动应用 ✨
-CMD ["python", "web_app.py"]
+EXPOSE 5257
+
+# 设置容器入口点
+ENTRYPOINT [ "/entrypoint.sh" ]

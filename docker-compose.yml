@@ -1,0 +1,18 @@
+version: '3'
+
+services:
+  emby-actor-processor:
+    image: hbq0405/emby-actor-processor:latest
+    container_name: emby-actor-processor
+    network_mode: bridge
+    environment:
+      - TZ=Asia/Shanghai         # 设置时区
+      - PUID=0                   # 设置为您的用户ID，默认为0，建议根据实际情况修改
+      - PGID=0                   # 设置为您的组ID，默认为0，建议根据实际情况修改
+      - UMASK=000                # 设置权限掩码，默认为000，建议根据实际情况修改
+    volumes:
+      - ./config:/config         # 配置文件目录
+      - ./tmdb:/tmdb             # 映射神医本地TMDB目录，必须配置
+    ports:
+      - "5257:5257"              # 应用端口
+    restart: unless-stopped
