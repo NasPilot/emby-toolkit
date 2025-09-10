@@ -61,26 +61,23 @@ class CoverGeneratorService:
         self._fonts_checked_and_ready = False
 
     # --- 核心公开方法 ---
-    def generate_for_library(self, emby_server_id: str, library: Dict[str, Any], item_count: Optional[int] = None):
+    def generate_for_library(self, emby_server_id: str, library: Dict[str, Any], item_count: Optional[int] = None, content_types: Optional[List[str]] = None):
         """
         为指定的媒体库生成并上传封面。
         这是从外部调用的主入口。
+        ★★★ 新增 content_types 参数，用于精确指定合集内容 ★★★
         """
-        # 获取排序方式对应的中文展示名，默认显示英文原值，避免KeyError
         sort_by_name = self.SORT_BY_DISPLAY_NAME.get(self._sort_by, self._sort_by)
-        # ★★★ 新增日志，明确当前使用的排序方式 ★★★
         logger.info(f"  -> 开始以排序方式: {sort_by_name} 为媒体库 '{library['Name']}' 生成封面...")
         
-        # 1. 确保字体文件已准备好 (已修改为自动下载)
         self.__get_fonts()
 
-        # 2. 生成封面图片数据
-        image_data = self.__generate_image_data(emby_server_id, library, item_count)
+        # ★★★ 将 content_types 传递下去 ★★★
+        image_data = self.__generate_image_data(emby_server_id, library, item_count, content_types)
         if not image_data:
             logger.error(f"为媒体库 '{library['Name']}' 生成封面图片失败。")
             return False
 
-        # 3. 上传封面到媒体服务器
         success = self.__set_library_image(emby_server_id, library, image_data)
         if success:
             logger.info(f"  -> ✅ 成功更新媒体库 '{library['Name']}' 的封面！")
@@ -91,27 +88,26 @@ class CoverGeneratorService:
 
     # --- 私有逻辑方法 (从原插件移植和修改) ---
 
-    def __generate_image_data(self, server_id: str, library: Dict[str, Any], item_count: Optional[int] = None) -> bytes:
+    def __generate_image_data(self, server_id: str, library: Dict[str, Any], item_count: Optional[int] = None, content_types: Optional[List[str]] = None) -> bytes:
         """根据配置和媒体库内容，生成最终的封面图片二进制数据"""
         library_name = library['Name']
         title = self.__get_library_title_from_yaml(library_name)
         
-        # 检查是否有自定义图片源
         custom_image_paths = self.__check_custom_image(library_name)
         if custom_image_paths:
             logger.info(f"发现媒体库 '{library_name}' 的自定义图片，将使用路径模式生成。")
             return self.__generate_image_from_path(library_name, title, custom_image_paths, item_count)
 
-        # 如果没有自定义图片，则从服务器获取
         logger.trace(f"未发现自定义图片，将从服务器 '{server_id}' 获取媒体项作为封面来源。")
-        return self.__generate_from_server(server_id, library, title, item_count)
+        # ★★★ 将 content_types 传递下去 ★★★
+        return self.__generate_from_server(server_id, library, title, item_count, content_types)
 
-    def __generate_from_server(self, server_id: str, library: Dict[str, Any], title: Tuple[str, str], item_count: Optional[int] = None) -> bytes:
+    def __generate_from_server(self, server_id: str, library: Dict[str, Any], title: Tuple[str, str], item_count: Optional[int] = None, content_types: Optional[List[str]] = None) -> bytes:
         """从媒体服务器获取项目并生成封面"""
         required_items_count = 1 if self._cover_style.startswith('single') else 9
         
-        # 获取媒体库中的有效媒体项 (已修改为支持随机)
-        items = self.__get_valid_items_from_library(server_id, library, required_items_count)
+        # ★★★ 将 content_types 传递下去 ★★★
+        items = self.__get_valid_items_from_library(server_id, library, required_items_count, content_types)
         if not items:
             logger.warning(f"在媒体库 '{library['Name']}' 中找不到任何带有可用图片的媒体项。")
             return None
@@ -140,10 +136,11 @@ class CoverGeneratorService:
             
             return self.__generate_image_from_path(library['Name'], title, image_paths, item_count)
 
-    def __get_valid_items_from_library(self, server_id: str, library: Dict[str, Any], limit: int) -> List[Dict]:
+    def __get_valid_items_from_library(self, server_id: str, library: Dict[str, Any], limit: int, content_types: Optional[List[str]] = None) -> List[Dict]:
         """
-        【最终修正版】从媒体库中获取足够数量的、包含有效图片的媒体项。
-        此版本会根据媒体库的类型动态确定要获取的媒体项类型。
+        【V2 - 封面生成最终修复版】
+        - 优先使用外部传入的 content_types 来确定要获取的媒体类型。
+        - 解决了无法获取合集(BoxSet)内部媒体项的问题。
         """
         library_id = library.get("Id") or library.get("ItemId")
         library_name = library.get("Name")
@@ -152,45 +149,41 @@ class CoverGeneratorService:
         api_key = config_manager.APP_CONFIG.get('emby_api_key')
         user_id = config_manager.APP_CONFIG.get('emby_user_id')
 
-        # --- ★★★ 核心修复：动态确定要获取的媒体类型 ★★★ ---
-        
-        # 1. 定义完整的类型映射
-        TYPE_MAP = {
-            'movies': 'Movie', 
-            'tvshows': 'Series', 
-            'music': 'MusicAlbum',
-            'boxsets': 'BoxSet', 
-            'mixed': 'Movie,Series',
-            'audiobooks': 'AudioBook'
-        }
-
-        # 2. 使用 if/elif 逻辑来确定正确的查询类型
+        # --- ★★★ 核心修复：重新设计媒体类型确定逻辑 ★★★ ---
         item_types_to_fetch = None
-        collection_type = library.get('CollectionType')
+        
+        # 1. 优先使用调用者传入的精确内容类型
+        if content_types:
+            item_types_to_fetch = ",".join(content_types)
+            logger.trace(f"  -> 使用调用者提供的精确内容类型: '{item_types_to_fetch}'")
+        else:
+            # 2. 如果没有传入，再回退到基于媒体库类型的猜测
+            TYPE_MAP = {
+                'movies': 'Movie', 'tvshows': 'Series', 'music': 'MusicAlbum',
+                'boxsets': 'Movie,Series', # ★ 关键修正：合集里装的是电影和剧集
+                'mixed': 'Movie,Series', 'audiobooks': 'AudioBook'
+            }
+            collection_type = library.get('CollectionType')
+            if collection_type:
+                item_types_to_fetch = TYPE_MAP.get(collection_type)
+            elif library.get('Type') == 'CollectionFolder':
+                item_types_to_fetch = 'Movie,Series'
 
-        if collection_type:
-            item_types_to_fetch = TYPE_MAP.get(collection_type)
-        elif library.get('Type') == 'CollectionFolder':
-            logger.info(f"媒体库 '{library_name}' 是一个特殊的 CollectionFolder，将按混合库处理。")
-            item_types_to_fetch = 'Movie,Series'
-
-        # 3. 如果经过判断后仍然无法确定类型，提供一个最终的备用方案并记录警告
         if not item_types_to_fetch:
-            logger.trace(f"无法为媒体库 '{library_name}' 确定媒体类型，将使用默认值 'Movie,Series,MusicAlbum' 进行尝试。")
-            item_types_to_fetch = 'Movie,Series,MusicAlbum'
+            logger.warning(f"无法为媒体库 '{library_name}' 确定媒体类型，将使用默认值 'Movie,Series' 尝试。")
+            item_types_to_fetch = 'Movie,Series'
             
         logger.trace(f"  -> 正在为媒体库 '{library_name}' 获取类型为 '{item_types_to_fetch}' 的项目...")
 
-        # 4. 使用动态确定的类型去调用 emby_handler
         all_items = emby_handler.get_emby_library_items(
             base_url=base_url,
             api_key=api_key,
             user_id=user_id,
             library_ids=[library_id],
-            media_type_filter=item_types_to_fetch,  # <-- 使用我们动态生成的变量！
-            fields="Id,Name,Type,ImageTags,BackdropImageTags,DateCreated"
+            media_type_filter=item_types_to_fetch,
+            fields="Id,Name,Type,ImageTags,BackdropImageTags,DateCreated",
+            force_user_endpoint=True
         )
-        # --- 修复结束 ---
         
         if not all_items:
             return []

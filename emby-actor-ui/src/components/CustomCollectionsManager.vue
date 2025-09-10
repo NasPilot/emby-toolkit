@@ -140,7 +140,26 @@
               </n-space>
             </n-radio-group>
           </n-form-item>
-
+          <n-form-item label="筛选范围" path="definition.library_ids">
+            <template #label>
+              筛选范围
+              <n-tooltip trigger="hover">
+                <template #trigger>
+                  <n-icon :component="HelpIcon" style="margin-left: 4px;" />
+                </template>
+                指定此规则仅在选定的媒体库中生效。如果留空，则默认筛选所有媒体库。
+              </n-tooltip>
+            </template>
+            <n-select
+              v-model:value="currentCollection.definition.library_ids"
+              multiple
+              filterable
+              clearable
+              placeholder="留空则筛选所有媒体库"
+              :options="embyLibraryOptions"
+              :loading="isLoadingLibraries"
+            />
+          </n-form-item>
           <n-form-item label="筛选规则" path="definition.rules">
             <div style="width: 100%;">
               <n-space v-for="(rule, index) in currentCollection.definition.rules" :key="index" style="margin-bottom: 12px;" align="center">
@@ -543,6 +562,8 @@ const subscribing = ref({});
 const actorOptions = ref([]); 
 const isSearchingActors = ref(false); 
 const isSavingOrder = ref(false);
+const embyLibraryOptions = ref([]);
+const isLoadingLibraries = ref(false);
 let sortableInstance = null;
 
 const builtInLists = [
@@ -629,6 +650,7 @@ const getInitialFormModel = () => ({
     item_type: ['Movie'],
     url: '',
     limit: null,
+    library_ids: [],
     // --- ▼▼▼ 核心修改 2/3：为新创建的合集设置更合理的默认排序 ▼▼▼ ---
     default_sort_by: 'original', // 对于榜单类型，默认使用原始顺序
     default_sort_order: 'Ascending',
@@ -646,22 +668,34 @@ watch(() => currentCollection.value.type, (newType) => {
       item_type: ['Movie'],
       logic: 'AND',
       rules: [{ field: null, operator: null, value: '' }],
-      // --- ▼▼▼ 核心修改 3/3：为筛选类型设置不同的默认排序 ▼▼▼ ---
-      default_sort_by: 'PremiereDate', // 筛选类型默认按上映日期降序
+      library_ids: [],
+      default_sort_by: 'PremiereDate', 
       default_sort_order: 'Descending'
-      // --- ▲▲▲ 修改结束 ▲▲▲ ---
     };
   } else if (newType === 'list') {
     currentCollection.value.definition = { 
       item_type: ['Movie'],
       url: '',
       limit: null,
-      default_sort_by: 'original', // 榜单类型默认使用原始顺序
+      default_sort_by: 'original', 
       default_sort_order: 'Ascending'
     };
     selectedBuiltInList.value = 'custom';
   }
 });
+
+// 获取 Emby 媒体库列表
+const fetchEmbyLibraries = async () => {
+  isLoadingLibraries.value = true;
+  try {
+    const response = await axios.get('/api/custom_collections/config/emby_libraries');
+    embyLibraryOptions.value = response.data;
+  } catch (error) {
+    message.error('获取Emby媒体库列表失败。');
+  } finally {
+    isLoadingLibraries.value = false;
+  }
+};
 
 const fetchCountryOptions = async () => {
   try {
@@ -1254,6 +1288,7 @@ onMounted(() => {
   fetchGenreOptions();
   fetchTagOptions();
   fetchUnifiedRatingOptions();
+  fetchEmbyLibraries();
 });
 </script>
 

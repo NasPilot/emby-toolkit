@@ -29,7 +29,7 @@ import { useAuthStore } from '../stores/auth';
 
 const router = useRouter(); // ★ 2. 获取 router 实例
 const credentials = ref({
-  username: 'admin',
+  username: '',
   password: '',
 });
 const loading = ref(false);

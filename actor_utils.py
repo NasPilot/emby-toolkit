@@ -231,19 +231,6 @@ def translate_actor_field(text: Optional[str], db_manager: ActorDBManager, db_cu
             logger.error(f"AI翻译器在翻译 '{text_stripped}' 时发生异常: {e_ai}")
             # 不做任何事，让流程继续往下走，尝试传统引擎
 
-    # 步骤 2: 如果AI翻译未启用，或AI翻译失败/未返回结果，则使用传统引擎
-    if not final_translation:
-        if ai_translation_attempted:
-            logger.warning(f"AI翻译未能获取有效结果，将降级使用传统翻译引擎...")
-        
-        translation_result = utils.translate_text_with_translators(
-            text_stripped,
-            engine_order=translator_engines
-        )
-        if translation_result and translation_result.get("text"):
-            final_translation = translation_result["text"]
-            final_engine = translation_result["engine"]
-
     # 5. 处理在线翻译的结果，并更新缓存
     if final_translation and final_translation.strip() and final_translation.strip().lower() != text_stripped.lower():
         # 翻译成功，存入缓存并返回结果
@@ -408,18 +395,17 @@ def enrich_all_actor_aliases_task(
     run_duration_minutes: int,
     sync_interval_days: int,
     stop_event: Optional[threading.Event] = None,
-    update_status_callback: Optional[Callable] = None
+    update_status_callback: Optional[Callable] = None,
+    force_full_update: bool = False  # <-- 新增参数
 ):
     """
-    【V6 - PostgreSQL 兼容最终版】
-    - 修复了所有 SQLite 特有的 SQL 语法和 Python 驱动 API 调用。
-    - datetime() -> NOW() - INTERVAL '...'
-    - INSERT OR REPLACE -> INSERT ... ON CONFLICT ... DO UPDATE
-    - cursor.execute().fetchall() -> 分两行执行
-    - "UNIQUE constraint failed" -> "violates unique constraint"
-    - conn.in_transaction -> 移除检查，直接 rollback
+    【V7 - 真·深度模式】
+    - 新增 force_full_update 参数。
+    - 深度模式下，将扫描所有含TMDb ID的演员，无视其是否已有IMDb ID。
+    - 深度模式下，遇到IMDb ID冲突时，将强制以TMDb数据为准，清除旧记录的IMDb ID。
     """
-    logger.trace("--- 开始执行“演员数据补充”计划任务 ---")
+    task_mode = "(全量)" if force_full_update else "(增量)"
+    logger.info(f"--- 开始执行“演员数据补充”计划任务 [{task_mode}] ---")
     
     start_time = time.time()
     end_time = float('inf')
@@ -438,16 +424,28 @@ def enrich_all_actor_aliases_task(
             logger.info("  -> 阶段一：从 TMDb 补充演员元数据 (IMDb ID, 头像等) ---")
             cursor = conn.cursor()
             
-            # ★★★ 核心修复 1/5：使用 PostgreSQL 的日期计算语法 ★★★
-            sql_find_tmdb_needy = f"""
-                SELECT p.* FROM person_identity_map p
-                LEFT JOIN actor_metadata m ON p.tmdb_person_id = m.tmdb_id
-                WHERE p.tmdb_person_id IS NOT NULL AND (p.imdb_id IS NULL OR m.tmdb_id IS NULL OR m.profile_path IS NULL OR m.gender IS NULL OR m.original_name IS NULL)
-                AND (m.last_updated_at IS NULL OR m.last_updated_at < NOW() - INTERVAL '{SYNC_INTERVAL_DAYS} days')
-                ORDER BY m.last_updated_at ASC
-            """
-            # ★★★ 核心修复 2/5：psycopg2 不支持链式调用 .fetchall() ★★★
-            cursor.execute(sql_find_tmdb_needy)
+            # ▼▼▼ 2. 根据 force_full_update 选择不同的SQL查询语句 ▼▼▼
+            if force_full_update:
+                logger.info("  -> 深度模式已激活：将扫描所有演员，无视现有数据。")
+                # 【深度模式查询】：获取所有带TMDb ID的演员，按最近更新时间排序，优先处理最久未更新的
+                sql_find_actors = f"""
+                    SELECT p.* FROM person_identity_map p
+                    LEFT JOIN actor_metadata m ON p.tmdb_person_id = m.tmdb_id
+                    WHERE p.tmdb_person_id IS NOT NULL
+                    ORDER BY m.last_updated_at ASC NULLS FIRST
+                """
+            else:
+                logger.info(f"  -> 标准模式：将仅扫描需要补充数据且冷却期已过的演员 (冷却期: {sync_interval_days} 天)。")
+                # 【标准模式查询】：只找那些缺少关键信息，并且过了冷却期的演员
+                sql_find_actors = f"""
+                    SELECT p.* FROM person_identity_map p
+                    LEFT JOIN actor_metadata m ON p.tmdb_person_id = m.tmdb_id
+                    WHERE p.tmdb_person_id IS NOT NULL AND (p.imdb_id IS NULL OR m.tmdb_id IS NULL OR m.profile_path IS NULL OR m.gender IS NULL OR m.original_name IS NULL)
+                    AND (m.last_updated_at IS NULL OR m.last_updated_at < NOW() - INTERVAL '{sync_interval_days} days')
+                    ORDER BY m.last_updated_at ASC
+                """
+            
+            cursor.execute(sql_find_actors)
             actors_for_tmdb = cursor.fetchall()
             
             if actors_for_tmdb:
@@ -548,12 +546,59 @@ def enrich_all_actor_aliases_task(
 
                             for imdb_id, tmdb_id in imdb_updates_to_commit:
                                 try:
+                                    cursor.execute("SAVEPOINT imdb_update_savepoint")
                                     cursor.execute("UPDATE person_identity_map SET imdb_id = %s WHERE tmdb_person_id = %s", (imdb_id, tmdb_id))
+                                    cursor.execute("RELEASE SAVEPOINT imdb_update_savepoint")
                                 except psycopg2.IntegrityError as ie:
-                                    # ★★★ 核心修复 4/5：使用 PostgreSQL 的错误信息判断冲突 ★★★
+                                    cursor.execute("ROLLBACK TO SAVEPOINT imdb_update_savepoint")
                                     if "violates unique constraint" in str(ie):
-                                        logger.warning(f"  -> 检测到 IMDb ID '{imdb_id}' (来自TMDb: {tmdb_id}) 冲突。将执行合并逻辑。")
-                                        # ... (合并逻辑保持不变)
+                                        # ▼▼▼ 3. 修改冲突处理逻辑 ▼▼▼
+                                        if force_full_update:
+                                            logger.warning(f"  -> [深度模式] 检测到 IMDb ID '{imdb_id}' 冲突。将强制以TMDb数据为准。")
+                                            # 找到当前占用该IMDb ID的旧记录
+                                            cursor.execute("SELECT map_id, primary_name FROM person_identity_map WHERE imdb_id = %s", (imdb_id,))
+                                            conflicting_actor = cursor.fetchone()
+                                            if conflicting_actor:
+                                                logger.warning(f"  -> 正在解除演员 '{conflicting_actor['primary_name']}' (map_id: {conflicting_actor['map_id']}) 与 IMDb ID '{imdb_id}' 的旧关联。")
+                                                # 将旧记录的IMDb ID设为NULL，以解除占用
+                                                cursor.execute("UPDATE person_identity_map SET imdb_id = NULL WHERE map_id = %s", (conflicting_actor['map_id'],))
+                                                
+                                                # 再次尝试为当前演员更新IMDb ID
+                                                logger.info(f"  -> 正在为当前演员 (TMDb: {tmdb_id}) 设置新的 IMDb ID '{imdb_id}'。")
+                                                cursor.execute("UPDATE person_identity_map SET imdb_id = %s WHERE tmdb_person_id = %s", (imdb_id, tmdb_id))
+                                            else:
+                                                logger.error(f"  -> 发生冲突但未能找到 IMDb ID '{imdb_id}' 的冲突记录，更新失败。")
+                                        else:
+                                            # 【标准模式下的合并逻辑保持不变】
+                                            logger.warning(f"  -> [标准模式] 检测到 IMDb ID '{imdb_id}' (来自TMDb: {tmdb_id}) 冲突。将执行合并逻辑。")
+                                        sql_find_target = "SELECT * FROM person_identity_map WHERE imdb_id = %s"
+                                        cursor.execute(sql_find_target, (imdb_id,))
+                                        target_actor = cursor.fetchone()
+                                        
+                                        sql_find_source = "SELECT * FROM person_identity_map WHERE tmdb_person_id = %s"
+                                        cursor.execute(sql_find_source, (tmdb_id,))
+                                        source_actor = cursor.fetchone()
+
+                                        if target_actor and source_actor and source_actor['map_id'] != target_actor['map_id']:
+                                            target_map_id = target_actor['map_id']
+                                            source_map_id = source_actor['map_id']
+                                            
+                                            # 将源记录的所有ID合并到目标记录（如果目标记录缺少这些ID）
+                                            if not target_actor.get('tmdb_person_id'):
+                                                cursor.execute("UPDATE person_identity_map SET tmdb_person_id = %s WHERE map_id = %s", (source_actor['tmdb_person_id'], target_map_id))
+                                            if source_actor.get('douban_celebrity_id') and not target_actor.get('douban_celebrity_id'):
+                                                cursor.execute("UPDATE person_identity_map SET douban_celebrity_id = %s WHERE map_id = %s", (source_actor['douban_celebrity_id'], target_map_id))
+                                            if source_actor.get('emby_person_id') and not target_actor.get('emby_person_id'):
+                                                 cursor.execute("UPDATE person_identity_map SET emby_person_id = %s WHERE map_id = %s", (source_actor['emby_person_id'], target_map_id))
+
+                                            # 删除现在多余的源记录
+                                            cursor.execute("DELETE FROM person_identity_map WHERE map_id = %s", (source_map_id,))
+                                            logger.info(f"  -> 成功将记录 (map_id:{source_map_id}) 合并到 (map_id:{target_map_id}) 并删除原记录。")
+                                        
+                                        elif not target_actor:
+                                            logger.error(f"  -> 发生冲突但未能找到 IMDb ID '{imdb_id}' 的目标记录，合并失败。")
+                                        elif not source_actor:
+                                            logger.error(f"  -> 发生冲突但未能找到 TMDb ID '{tmdb_id}' 的源记录，合并失败。")
                                     else:
                                         raise ie
 
@@ -575,14 +620,12 @@ def enrich_all_actor_aliases_task(
             douban_api = DoubanApi()
             logger.info("  -> 阶段二：从 豆瓣 补充 IMDb ID ---")
             cursor = conn.cursor()
-            # ★★★ 核心修复 1/5 (再次应用)：使用 PostgreSQL 的日期计算语法 ★★★
             sql_find_douban_needy = f"""
                 SELECT * FROM person_identity_map 
                 WHERE douban_celebrity_id IS NOT NULL AND imdb_id IS NULL AND tmdb_person_id IS NULL
                 AND (last_synced_at IS NULL OR last_synced_at < NOW() - INTERVAL '{SYNC_INTERVAL_DAYS} days')
                 ORDER BY last_synced_at ASC
             """
-            # ★★★ 核心修复 2/5 (再次应用)：分离 execute 和 fetchall ★★★
             cursor.execute(sql_find_douban_needy)
             actors_for_douban = cursor.fetchall()
 
@@ -620,11 +663,13 @@ def enrich_all_actor_aliases_task(
                                 logger.info(f"  ({i+1}/{total_douban}) 为演员 '{actor_primary_name}' (Douban: {actor_douban_id}) 找到 IMDb ID: {new_imdb_id}")
                                 
                                 try:
+                                    cursor.execute("SAVEPOINT douban_update_savepoint")
                                     sql_update_imdb = "UPDATE person_identity_map SET imdb_id = %s WHERE map_id = %s"
                                     cursor.execute(sql_update_imdb, (new_imdb_id, actor_map_id))
+                                    cursor.execute("RELEASE SAVEPOINT douban_update_savepoint")
                                 
                                 except psycopg2.IntegrityError as ie:
-                                    # ★★★ 核心修复 4/5 (再次应用)：使用 PostgreSQL 的错误信息判断冲突 ★★★
+                                    cursor.execute("ROLLBACK TO SAVEPOINT douban_update_savepoint")
                                     if "violates unique constraint" in str(ie):
                                         logger.warning(f"  -> 检测到 IMDb ID '{new_imdb_id}' 冲突。将尝试合并记录。")
                                         
@@ -649,6 +694,7 @@ def enrich_all_actor_aliases_task(
                             conn.commit()
 
                     except Exception as e:
+                        conn.rollback()
                         logger.error(f"处理演员 '{actor_primary_name}' (Douban: {actor_douban_id}) 时发生错误: {e}")
                 
                 conn.commit()

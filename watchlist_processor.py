@@ -10,6 +10,8 @@ import threading
 import db_handler
 from db_handler import get_db_connection as get_central_db_connection
 # 导入我们需要的辅助模块
+import moviepilot_handler
+import constants
 import tmdb_handler
 import emby_handler
 import logging
@@ -259,8 +261,19 @@ class WatchlistProcessor:
                     self.progress_callback(progress, f"进度: {processed_count}/{total} - {series_info['item_name'][:15]}...")
 
             if not self.is_stop_requested():
-                self.progress_callback(100, "并发追剧检查任务完成。")
+                # 根据是全量刷新还是单项刷新，显示不同的过渡消息
+                if not item_id:
+                    self.progress_callback(100, "常规追剧检查完成，即将开始洗版检查...")
+                else:
+                    self.progress_callback(100, f"项目 {item_id} 常规检查完成，即将为其单独检查洗版...")
+                
+                time.sleep(2) # 给用户一点时间看消息
+
+                # 调用我们新的、可复用的洗版检查函数
+                # 如果是单项刷新，把 item_id 也传过去
+                self._run_wash_plate_check_logic(progress_callback=self.progress_callback, item_id=item_id)
             else:
+                # 如果任务被中止，直接结束
                 self.progress_callback(100, "任务已停止。")
 
         except Exception as e:
@@ -310,7 +323,7 @@ class WatchlistProcessor:
                         "paused_until": None,
                         "tmdb_status": new_tmdb_status,
                         # 【关键】一旦因新一季而复活，就必须重置 force_ended 标志，让它恢复正常追剧逻辑
-                        "force_ended": 0 
+                        "force_ended": False 
                     }
                     self._update_watchlist_entry(series['item_id'], series['item_name'], updates_to_db)
                 
@@ -324,6 +337,121 @@ class WatchlistProcessor:
             self.progress_callback(-1, f"错误: {e}")
         finally:
             self.progress_callback = None
+
+    # ★★★ 已完结剧集缺集洗版检查 ★★★
+    def _run_wash_plate_check_logic(self, progress_callback: callable, item_id: Optional[str] = None):
+        """
+        【V11 - 最终悖论修复版】
+        采用全新的三阶段查询，在不破坏核心状态逻辑的前提下，精确查找所有需要洗版的剧集。
+        """
+        task_name = "洗版缺集的季"
+        
+        if not self.config.get(constants.CONFIG_OPTION_RESUBSCRIBE_COMPLETED_ON_MISSING):
+            logger.info(f"'{task_name}' 功能未启用，跳过。")
+            if progress_callback: progress_callback(100, "所有流程已完成（洗版功能未启用）。")
+            return
+
+        logger.info(f"--- 后台任务 '{task_name}' 开始执行 ---")
+        if progress_callback: progress_callback(0, "正在查找需要洗版的剧集...")
+
+        try:
+            series_to_check = []
+            if item_id:
+                series_to_check = self._get_series_to_process("", item_id=item_id)
+            else:
+                # ★★★ 核心逻辑：三阶段查询，捕获所有目标 ★★★
+
+                # 阶段一：捕获“TMDb已完结，但因缺集而卡在追剧中”的剧集 (例如《长相思》)
+                stuck_series = self._get_series_to_process(
+                    f"""
+                    WHERE status IN ('{STATUS_WATCHING}', '{STATUS_PAUSED}')
+                      AND tmdb_status IN ('Ended', 'Canceled')
+                      AND jsonb_typeof(missing_info_json) IN ('object', 'array')
+                    """
+                )
+                logger.info(f"  -> 阶段1：发现 {len(stuck_series)} 部 TMDb已完结但卡在追剧中的剧集。")
+
+                # 阶段二：捕获“僵尸剧”
+                today_minus_365_days = (datetime.now(timezone.utc).date() - timedelta(days=365)).isoformat()
+                zombie_series = self._get_series_to_process(
+                    f"""
+                    WHERE status IN ('{STATUS_WATCHING}', '{STATUS_PAUSED}')
+                      AND tmdb_status NOT IN ('Ended', 'Canceled')
+                      AND jsonb_typeof(last_episode_to_air_json) = 'object'
+                      AND (last_episode_to_air_json->>'air_date')::date < '{today_minus_365_days}'
+                    """
+                )
+                logger.info(f"  -> 阶段2：发现 {len(zombie_series)} 部Tmdb状态滞后的“僵尸剧”。")
+
+                # 阶段三：捕获“已正常完结，但后来文件又被删除”的剧集
+                completed_missing_series = self._get_series_to_process(
+                    f"WHERE status = '{STATUS_COMPLETED}' AND jsonb_typeof(missing_info_json) IN ('object', 'array')"
+                )
+                logger.info(f"  -> 阶段3：发现 {len(completed_missing_series)} 部已完结但文件缺失的剧集。")
+
+                # 合并所有结果并去重
+                all_series_map = {s['item_id']: s for s in stuck_series}
+                all_series_map.update({s['item_id']: s for s in zombie_series})
+                all_series_map.update({s['item_id']: s for s in completed_missing_series})
+                series_to_check = list(all_series_map.values())
+            
+            total = len(series_to_check)
+            if not series_to_check:
+                if progress_callback: progress_callback(100, "所有流程已完成，未发现需洗版的剧集。")
+                return
+
+            logger.info(f"  -> 共发现 {total} 部剧集需要洗版，开始处理...")
+            total_seasons_subscribed = 0
+
+            # 循环内部的订阅逻辑是正确的，保持不变
+            for i, series in enumerate(series_to_check):
+                if self.is_stop_requested(): break
+                item_name = series.get('item_name', '未知剧集')
+                
+                # 7天宽限期判断 (只对TMDb已完结的剧生效)
+                if series.get('tmdb_status') in ['Ended', 'Canceled']:
+                    last_episode_info = series.get('last_episode_to_air_json')
+                    if last_episode_info and isinstance(last_episode_info, dict):
+                        last_air_date_str = last_episode_info.get('air_date')
+                        if last_air_date_str:
+                            try:
+                                last_air_date = datetime.strptime(last_air_date_str, '%Y-%m-%d').date()
+                                days_since_airing = (datetime.now(timezone.utc).date() - last_air_date).days
+                                if days_since_airing < 7:
+                                    logger.info(f"  -> 《{item_name}》完结未满7天，跳过洗版。")
+                                    continue
+                            except ValueError: pass
+                
+                missing_info = series.get('missing_info_json')
+                seasons_to_resubscribe = set()
+                if missing_info:
+                    for season in missing_info.get("missing_seasons", []):
+                        if season.get('season_number') is not None: seasons_to_resubscribe.add(season['season_number'])
+                    for episode in missing_info.get("missing_episodes", []):
+                        if episode.get('season_number') is not None: seasons_to_resubscribe.add(episode['season_number'])
+                
+                if not seasons_to_resubscribe: continue
+
+                logger.warning(f"  -> 检测到剧集《{item_name}》存在缺集: {sorted(list(seasons_to_resubscribe))}，准备逐季触发洗版订阅。")
+
+                for season_num in sorted(list(seasons_to_resubscribe)):
+                    success = moviepilot_handler.subscribe_series_to_moviepilot(
+                        series_info=series, season_number=season_num,
+                        config=self.config, best_version=1
+                    )
+                    if success: total_seasons_subscribed += 1
+                    time.sleep(1)
+                time.sleep(1)
+
+            final_message = f"  -> 所有流程已完成！共为 {total_seasons_subscribed} 个缺失的季提交了洗版订阅。"
+            if progress_callback: progress_callback(100, final_message)
+            logger.info(f"--- 后台任务 '{task_name}' 结束，最终状态: 处理完成。 ---")
+
+        except Exception as e:
+            logger.error(f"执行 '{task_name}' 时发生严重错误: {e}", exc_info=True)
+            if progress_callback: progress_callback(-1, f"错误: {e}")
+        finally:
+            if progress_callback: self.progress_callback = None
 
     def _get_series_to_process(self, where_clause: str, item_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
@@ -475,7 +603,8 @@ class WatchlistProcessor:
             "paused_until": paused_until_date.isoformat() if paused_until_date else None,
             "tmdb_status": new_tmdb_status,
             "next_episode_to_air_json": json.dumps(real_next_episode_to_air) if real_next_episode_to_air else None,
-            "missing_info_json": json.dumps(missing_info)
+            "missing_info_json": json.dumps(missing_info),
+            "last_episode_to_air_json": json.dumps(last_episode_to_air) if last_episode_to_air else None
         }
         self._update_watchlist_entry(item_id, item_name, updates_to_db)
 

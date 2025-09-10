@@ -5,6 +5,7 @@ import json
 import logging
 from flask import Blueprint, request, jsonify
 import task_manager
+import db_handler
 from extensions import media_processor_instance
 import config_manager # 导入以获取数据路径
 from extensions import login_required
@@ -17,9 +18,6 @@ logger = logging.getLogger(__name__)
 
 # 创建一个新的蓝图
 cover_generator_config_bp = Blueprint('cover_generator_config', __name__, url_prefix='/api/config/cover_generator')
-
-# 定义配置文件的路径
-CONFIG_FILE_PATH = os.path.join(config_manager.PERSISTENT_DATA_PATH, "cover_generator.json")
 
 def get_default_config():
     """返回一份与新UI匹配的、精简后的默认配置"""
@@ -64,16 +62,20 @@ def get_default_config():
 def get_cover_generator_config():
     """获取封面生成器的配置"""
     try:
-        if os.path.exists(CONFIG_FILE_PATH):
-            with open(CONFIG_FILE_PATH, 'r', encoding='utf-8') as f:
-                config = json.load(f)
+        # ★★★ 核心修改 3：从数据库读取配置 ★★★
+        config = db_handler.get_setting('cover_generator_config')
+        
+        if config:
+            # 如果数据库中有配置，为了确保未来新增的配置项也能显示，与默认值合并
             default_config = get_default_config()
             for key, value in default_config.items():
                 if key not in config:
                     config[key] = value
             return jsonify(config)
         else:
+            # 如果数据库中没有，说明是第一次，直接返回默认配置
             return jsonify(get_default_config())
+            
     except Exception as e:
         logger.error(f"读取封面生成器配置失败: {e}", exc_info=True)
         return jsonify({"error": "读取配置失败"}), 500
@@ -85,9 +87,10 @@ def save_cover_generator_config():
     """保存封面生成器的配置"""
     try:
         new_config = request.json
-        with open(CONFIG_FILE_PATH, 'w', encoding='utf-8') as f:
-            json.dump(new_config, f, indent=4, ensure_ascii=False)
-        logger.info("封面生成器配置已保存。")
+        # ★★★ 核心修改 4：将配置保存到数据库 ★★★
+        db_handler.save_setting('cover_generator_config', new_config)
+        
+        logger.info("封面生成器配置已保存到数据库。")
         return jsonify({"message": "配置已成功保存！"})
     except Exception as e:
         logger.error(f"保存封面生成器配置失败: {e}", exc_info=True)

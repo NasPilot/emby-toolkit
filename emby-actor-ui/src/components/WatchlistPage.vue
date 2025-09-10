@@ -56,6 +56,20 @@
               </template>
               立即检查所有在追剧集
             </n-tooltip>
+            <n-popconfirm @positive-click="handleCheckCompleted">
+              <template #trigger>
+                <n-tooltip>
+                  <template #trigger>
+                    <n-button type="warning" ghost circle :loading="isTaskRunning('resubscribe-completed')">
+                      <template #icon><n-icon :component="DownloadIcon" /></template>
+                    </n-button>
+                  </template>
+                  检查已完结剧集 (洗版)
+                </n-tooltip>
+              </template>
+              确定要立即检查所有“已完结”的剧集，并为其中缺集的季提交洗版订阅吗？<br>
+              <strong style="color: var(--n-warning-color);">此操作可能会一次性提交大量订阅任务，请谨慎操作！</strong>
+            </n-popconfirm>
           </n-space>
         </template>
       </n-page-header>

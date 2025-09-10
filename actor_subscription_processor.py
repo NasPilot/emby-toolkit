@@ -231,11 +231,14 @@ class ActorSubscriptionProcessor:
             if config_genres_include and genre_ids.isdisjoint(config_genres_include): continue
 
             if config_min_rating > 0:
+                vote_average = work.get('vote_average', 0.0)
+                # vote_count = work.get('vote_count', 0) # 移除投票数条件
+                
                 is_new_movie = release_date_str >= grace_period_end_date_str
+                
                 if not is_new_movie:
-                    vote_average = work.get('vote_average', 0.0)
-                    vote_count = work.get('vote_count', 0)
-                    if vote_count > 50 and vote_average < config_min_rating:
+                    # 对于老片，只根据评分进行过滤，不再考虑投票数
+                    if vote_average < config_min_rating:
                         logger.trace(f"  -> 过滤老片: '{work.get('title') or work.get('name')}' (评分 {vote_average} < {config_min_rating})")
                         continue
             

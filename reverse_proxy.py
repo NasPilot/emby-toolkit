@@ -240,56 +240,75 @@ def handle_mimicked_library_metadata_endpoint(path, mimicked_id, params):
         return Response(json.dumps([]), mimetype='application/json')
     
 def handle_get_mimicked_library_items(user_id, mimicked_id, params):
+    """
+    【V5 - Emby ID 权威数据源 & 排序保持重构版】
+    - 直接从数据库 `generated_media_info_json` 读取权威的、有序的 Emby ID 列表。
+    - 使用批量接口精确获取媒体项，然后根据数据库中的顺序重新排序。
+    - 完美支持 'original' (榜单原始顺序) 排序。
+    """
     try:
         real_db_id = from_mimicked_id(mimicked_id)
         collection_info = db_handler.get_custom_collection_by_id(real_db_id)
-        if not collection_info or not collection_info.get('emby_collection_id'):
+        if not collection_info:
             return Response(json.dumps({"Items": [], "TotalRecordCount": 0}), mimetype='application/json')
 
         definition = collection_info.get('definition_json') or {}
-        real_emby_collection_id = collection_info.get('emby_collection_id')
-
-        # ==========================================================
-        # ▼▼▼ 全新的、由你构思的两段式筛选逻辑 ▼▼▼
-        # ==========================================================
-
-        # --- 阶段一：获取“肉身” (从真实的Emby合集获取基础内容) ---
-        logger.info(f"  -> 阶段1：正在从真实合集 '{collection_info['name']}' (ID: {real_emby_collection_id}) 获取基础内容...")
-        base_url, api_key = _get_real_emby_url_and_key()
         
-        base_items = emby_handler.get_emby_library_items(
-            base_url=base_url, api_key=api_key, user_id=user_id,
-            library_ids=[real_emby_collection_id],
-            fields="ProviderIds,UserData,Name,ProductionYear,CommunityRating,DateCreated,PremiereDate"
-        )
-        if not base_items:
+        # --- 阶段一：从数据库获取权威的、有序的 Emby ID 列表 ---
+        logger.trace(f"  -> 阶段1：为虚拟库 '{collection_info['name']}' 从DB读取有序Emby ID列表...")
+        db_media_list = collection_info.get('generated_media_info_json') or []
+        
+        # 提取所有有效的 Emby ID，这个列表的顺序就是我们的“原始榜单顺序”
+        ordered_emby_ids = [
+            item.get('emby_id') 
+            for item in db_media_list 
+            if item.get('emby_id')
+        ]
+        
+        if not ordered_emby_ids:
+            logger.trace("  -> 数据库中无 Emby ID 记录，返回空列表。")
             return Response(json.dumps({"Items": [], "TotalRecordCount": 0}), mimetype='application/json')
         
-        logger.info(f"  -> 阶段1完成：获取到 {len(base_items)} 个基础媒体项。")
+        logger.trace(f"  -> 阶段1完成：获取到 {len(ordered_emby_ids)} 个有序的 Emby ID。")
 
-        # --- 阶段二：“灵魂”注入 (如果启用了动态筛选，就执行二次过滤) ---
-        final_items = base_items
+        # --- 阶段二：使用权威 ID 列表，从 Emby 精确获取实时数据 ---
+        logger.trace(f"  -> 阶段2：正在从 Emby 批量获取这 {len(ordered_emby_ids)} 个媒体项的实时信息...")
+        base_url, api_key = _get_real_emby_url_and_key()
         
+        live_items_unordered = emby_handler.get_emby_items_by_id(
+            base_url=base_url, api_key=api_key, user_id=user_id,
+            item_ids=ordered_emby_ids,
+            fields="PrimaryImageAspectRatio,ProviderIds,UserData,Name,ProductionYear,CommunityRating,DateCreated,PremiereDate,Type,RecursiveItemCount,SortName"
+        )
+        
+        # ★★★ 关键点: Emby返回的可能是乱序的，我们必须根据DB中的顺序重新排序 ★★★
+        live_items_map = {item['Id']: item for item in live_items_unordered}
+        ordered_items = [live_items_map[emby_id] for emby_id in ordered_emby_ids if emby_id in live_items_map]
+        
+        logger.trace(f"  -> 阶段2完成：成功获取并按原始顺序排序了 {len(ordered_items)} 个实时媒体项。")
+
+        # --- 阶段三：动态筛选 ---
+        final_items = ordered_items
         if definition.get('dynamic_filter_enabled'):
-            logger.info("  -> 阶段2：检测到已启用实时用户筛选，开始二次过滤...")
-            
+            logger.trace("  -> 阶段3：执行实时用户筛选...")
             dynamic_definition = {
                 'rules': definition.get('dynamic_rules', []),
                 'logic': definition.get('dynamic_logic', 'AND')
             }
-            
             engine = FilterEngine()
-            final_items = engine.execute_dynamic_filter(base_items, dynamic_definition)
-            logger.info(f"  -> 阶段2完成：二次过滤后，剩下 {len(final_items)} 个媒体项。")
+            final_items = engine.execute_dynamic_filter(ordered_items, dynamic_definition)
+            logger.trace(f"  -> 阶段3完成：筛选后剩下 {len(final_items)} 个媒体项。")
         else:
-            logger.info("  -> 阶段2跳过：未启用实时用户筛选。")
+            logger.trace("  -> 阶段3跳过：未启用实时用户筛选。")
 
-        # --- 排序和返回 (复用你原来的逻辑) ---
+        # --- 阶段四：处理最终排序 ---
         sort_by_field = definition.get('default_sort_by')
-        if sort_by_field and sort_by_field != 'none' and sort_by_field != 'original':
+        
+        if sort_by_field and sort_by_field not in ['original', 'none']:
             sort_order = definition.get('default_sort_order', 'Ascending')
             is_descending = (sort_order == 'Descending')
             logger.trace(f"执行虚拟库排序劫持: '{sort_by_field}' ({sort_order})")
+            
             default_sort_value = 0 if sort_by_field in ['CommunityRating', 'ProductionYear'] else "0"
             try:
                 final_items.sort(
@@ -298,6 +317,10 @@ def handle_get_mimicked_library_items(user_id, mimicked_id, params):
                 )
             except TypeError:
                 final_items.sort(key=lambda item: item.get('SortName', ''))
+        elif sort_by_field == 'original':
+             logger.trace("已应用 'original' (榜单原始顺序) 排序。")
+        else:
+            logger.trace("未设置或禁用虚拟库排序，将保持榜单原始顺序。")
 
         final_response = {"Items": final_items, "TotalRecordCount": len(final_items)}
         return Response(json.dumps(final_response), mimetype='application/json')
@@ -312,7 +335,7 @@ def handle_get_latest_items(user_id, params):
         virtual_library_id = params.get('ParentId') or params.get('customViewId')
 
         if virtual_library_id and is_mimicked_id(virtual_library_id): # <-- 【核心修改】
-            logger.info(f"处理针对虚拟库 '{virtual_library_id}' 的最新媒体请求...")
+            logger.trace(f"处理针对虚拟库 '{virtual_library_id}' 的最新媒体请求...")
             try:
                 virtual_library_db_id = from_mimicked_id(virtual_library_id) # <-- 【核心修改】
             except (ValueError, TypeError):

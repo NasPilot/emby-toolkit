@@ -9,7 +9,7 @@ from datetime import datetime
 from croniter import croniter
 
 # 导入我们的任务链执行器和任务注册表
-from tasks import task_run_chain
+import tasks
 import config_manager # 导入配置管理器以读取配置
 import constants      # 导入常量以获取时区
 import extensions     # 导入 extensions 以获取共享的处理器实例
@@ -17,8 +17,10 @@ import task_manager   # 导入 task_manager 以提交任务
 
 logger = logging.getLogger(__name__)
 
-# 为我们的任务链定义一个独一无二、固定不变的ID
+# 自动化任务链
 CHAIN_JOB_ID = 'automated_task_chain_job'
+# 剧集复活检查
+REVIVAL_CHECK_JOB_ID = 'weekly_revival_check_job'
 
 # --- 友好的CRON日志翻译函数】 ---
 def _get_next_run_time_str(cron_expression: str) -> str:
@@ -94,6 +96,7 @@ class SchedulerManager:
             logger.info("定时任务调度器已启动。")
             # 在启动时，就根据当前配置更新一次任务
             self.update_task_chain_job()
+            self.update_revival_check_job()
         except Exception as e:
             logger.error(f"启动定时任务调度器失败: {e}", exc_info=True)
 
@@ -103,6 +106,58 @@ class SchedulerManager:
             self.scheduler.shutdown(wait=False)
             logger.info("定时任务调度器已关闭。")
 
+    # ★★★ 核心修改 4/4: 为复活检查任务创建一个专属的调度函数 ★★★
+    def update_revival_check_job(self):
+        """
+        【新增】根据硬编码的规则，设置每周的剧集复活检查任务。
+        """
+        if not self.scheduler.running:
+            logger.warning("调度器未运行，无法更新'剧集复活检查'任务。")
+            return
+
+        logger.trace("正在设置固定的'剧集复活检查'定时任务...")
+
+        try:
+            # 1. 同样，先移除旧的作业，防止重复
+            self.scheduler.remove_job(REVIVAL_CHECK_JOB_ID)
+        except JobLookupError:
+            pass # 没找到旧任务是正常的
+
+        # 2. 定义我们的固定调度规则
+        cron_str = '0 5 * * sun' # 每周日 (sun) 的 5点 (5) 0分 (0)
+
+        # 3. 从 tasks.py 的注册表里获取任务信息
+        registry = tasks.get_task_registry()
+        task_info = registry.get('revival-check')
+        
+        if not task_info:
+            logger.error("设置'剧集复活检查'任务失败：在任务注册表中未找到 'revival-check'。")
+            return
+            
+        task_function, task_description, processor_type = task_info
+
+        # 4. 创建一个包装函数，用于提交任务到 task_manager
+        def scheduled_revival_check_wrapper():
+            logger.info(f"定时任务触发：{task_description}。")
+            task_manager.submit_task(
+                task_function=task_function,
+                task_name=task_description,
+                processor_type=processor_type
+            )
+
+        # 5. 添加新的作业
+        try:
+            self.scheduler.add_job(
+                func=scheduled_revival_check_wrapper,
+                trigger=CronTrigger.from_crontab(cron_str, timezone=str(pytz.timezone(constants.TIMEZONE))),
+                id=REVIVAL_CHECK_JOB_ID,
+                name=task_description,
+                replace_existing=True
+            )
+            logger.trace(f"已成功设置'{task_description}'任务，执行计划: 每周日 05:00。")
+        except ValueError as e:
+            logger.error(f"设置'{task_description}'任务失败：CRON表达式 '{cron_str}' 无效。错误: {e}")
+    
     def update_task_chain_job(self):
         """
         【核心函数】根据当前配置文件，更新任务链的定时作业。
@@ -140,7 +195,7 @@ class SchedulerManager:
                     logger.info(f"定时任务触发：自动化任务链。")
                     # 注意：这里我们传递 task_sequence 作为参数
                     task_manager.submit_task(
-                        task_run_chain,
+                        tasks.task_run_chain,
                         "自动化任务链",
                         task_sequence=task_sequence
                     )

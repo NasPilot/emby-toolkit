@@ -7,6 +7,7 @@ import json
 
 # --- 核心模块导入 ---
 import constants # 你的常量定义
+import db_handler
 
 logger = logging.getLogger(__name__)
 
@@ -40,22 +41,30 @@ CONFIG_FILE_NAME = getattr(constants, 'CONFIG_FILE_NAME', "config.ini")
 CONFIG_FILE_PATH = os.path.join(PERSISTENT_DATA_PATH, CONFIG_FILE_NAME)
 LOG_DIRECTORY = os.path.join(PERSISTENT_DATA_PATH, 'logs')
 
-
-# ✨✨✨ “配置清单” - 这是配置模块的核心 ✨✨✨
-CONFIG_DEFINITION = {
-     # [Database] - ★★★ 新增PostgreSQL配置 ★★★
+# BOOTSTRAP_CONFIG_DEF: 只包含启动所必需的配置
+BOOTSTRAP_CONFIG_DEF = {
+    # [Database]
     constants.CONFIG_OPTION_DB_HOST: (constants.CONFIG_SECTION_DATABASE, 'string', 'localhost'),
     constants.CONFIG_OPTION_DB_PORT: (constants.CONFIG_SECTION_DATABASE, 'int', 5432),
     constants.CONFIG_OPTION_DB_USER: (constants.CONFIG_SECTION_DATABASE, 'string', 'postgres'),
     constants.CONFIG_OPTION_DB_PASSWORD: (constants.CONFIG_SECTION_DATABASE, 'string', 'your_password'),
     constants.CONFIG_OPTION_DB_NAME: (constants.CONFIG_SECTION_DATABASE, 'string', 'emby_toolkit'),
+    # [Authentication]
+    constants.CONFIG_OPTION_AUTH_ENABLED: (constants.CONFIG_SECTION_AUTH, 'boolean', False),
+    constants.CONFIG_OPTION_AUTH_USERNAME: (constants.CONFIG_SECTION_AUTH, 'string', constants.DEFAULT_USERNAME),
+}
 
+# ✨✨✨ “配置清单” - 这是配置模块的核心 ✨✨✨
+DYNAMIC_CONFIG_DEF = {
     # [Emby]
     constants.CONFIG_OPTION_EMBY_SERVER_URL: (constants.CONFIG_SECTION_EMBY, 'string', ""),
     constants.CONFIG_OPTION_EMBY_API_KEY: (constants.CONFIG_SECTION_EMBY, 'string', ""),
     constants.CONFIG_OPTION_EMBY_USER_ID: (constants.CONFIG_SECTION_EMBY, 'string', ""),
+    constants.CONFIG_OPTION_EMBY_API_TIMEOUT: (constants.CONFIG_SECTION_EMBY, 'int', 60),
     constants.CONFIG_OPTION_REFRESH_AFTER_UPDATE: (constants.CONFIG_SECTION_EMBY, 'boolean', True),
     constants.CONFIG_OPTION_EMBY_LIBRARIES_TO_PROCESS: (constants.CONFIG_SECTION_EMBY, 'list', []),
+    constants.CONFIG_OPTION_EMBY_ADMIN_USER: (constants.CONFIG_SECTION_EMBY, 'string', ""),
+constants.CONFIG_OPTION_EMBY_ADMIN_PASS: (constants.CONFIG_SECTION_EMBY, 'password', ""), 
 
     # [ReverseProxy]
     constants.CONFIG_OPTION_PROXY_ENABLED: (constants.CONFIG_SECTION_REVERSE_PROXY, 'boolean', False),
@@ -64,8 +73,6 @@ CONFIG_DEFINITION = {
     constants.CONFIG_OPTION_PROXY_NATIVE_VIEW_SELECTION: (constants.CONFIG_SECTION_REVERSE_PROXY, 'list', []),
     constants.CONFIG_OPTION_PROXY_NATIVE_VIEW_ORDER: (constants.CONFIG_SECTION_REVERSE_PROXY, 'str', 'before'),
     constants.CONFIG_OPTION_PROXY_302_REDIRECT_URL: (constants.CONFIG_SECTION_REVERSE_PROXY, 'string', ""),
-    constants.CONFIG_OPTION_PROXY_MERGE_NATIVE: (constants.CONFIG_SECTION_REVERSE_PROXY, 'boolean', True),
-    constants.CONFIG_OPTION_PROXY_NATIVE_VIEW_SELECTION: (constants.CONFIG_SECTION_REVERSE_PROXY, 'list', []),
     constants.CONFIG_OPTION_PROXY_NATIVE_VIEW_ORDER: (constants.CONFIG_SECTION_REVERSE_PROXY, 'str', 'before'),
 
     # [TMDB]
@@ -81,6 +88,9 @@ CONFIG_DEFINITION = {
     constants.CONFIG_OPTION_MOVIEPILOT_USERNAME: (constants.CONFIG_SECTION_MOVIEPILOT, 'string', ""),
     constants.CONFIG_OPTION_MOVIEPILOT_PASSWORD: (constants.CONFIG_SECTION_MOVIEPILOT, 'string', ""),
     constants.CONFIG_OPTION_AUTOSUB_ENABLED: (constants.CONFIG_SECTION_MOVIEPILOT, 'boolean', False),
+    constants.CONFIG_OPTION_RESUBSCRIBE_COMPLETED_ON_MISSING: (constants.CONFIG_SECTION_MOVIEPILOT, 'boolean', False),
+    constants.CONFIG_OPTION_RESUBSCRIBE_DAILY_CAP: (constants.CONFIG_SECTION_MOVIEPILOT, 'int', 200),
+    constants.CONFIG_OPTION_RESUBSCRIBE_DELAY_SECONDS: (constants.CONFIG_SECTION_MOVIEPILOT, 'float', 1.5),
     
     # [LocalDataSource]
     constants.CONFIG_OPTION_LOCAL_DATA_PATH: (constants.CONFIG_SECTION_LOCAL_DATA, 'string', ""),
@@ -110,10 +120,6 @@ CONFIG_DEFINITION = {
     constants.CONFIG_OPTION_TASK_CHAIN_CRON: (constants.CONFIG_SECTION_SCHEDULER, 'string', "0 2 * * *"),
     constants.CONFIG_OPTION_TASK_CHAIN_SEQUENCE: (constants.CONFIG_SECTION_SCHEDULER, 'list', []),
     
-    # [Authentication]
-    constants.CONFIG_OPTION_AUTH_ENABLED: (constants.CONFIG_SECTION_AUTH, 'boolean', False),
-    constants.CONFIG_OPTION_AUTH_USERNAME: (constants.CONFIG_SECTION_AUTH, 'string', constants.DEFAULT_USERNAME),
-    
     # [Actor]
     constants.CONFIG_OPTION_ACTOR_ROLE_ADD_PREFIX: (constants.CONFIG_SECTION_ACTOR, 'boolean', False),
 
@@ -127,12 +133,19 @@ CONFIG_DEFINITION = {
 APP_CONFIG: Dict[str, Any] = {}
 
 # --- 加载配置 ---
-def load_config() -> Tuple[Dict[str, Any], bool]:
+def load_config():
     """
-    【清单驱动+环境变量覆盖版】
-    从 config.ini 加载配置，然后用环境变量覆盖数据库配置。
+    【V3 - 混合模式最终版】
+    1. 从 config.ini 和环境变量加载启动配置。
+    2. 使用启动配置连接数据库。
+    3. 从数据库 app_settings 表加载动态应用配置。
     """
     global APP_CONFIG
+    
+    # ======================================================================
+    # 阶段 1: 加载启动配置 (从 config.ini 和环境变量)
+    # ======================================================================
+    bootstrap_config = {}
     config_parser = configparser.ConfigParser()
     is_first_run = not os.path.exists(CONFIG_FILE_PATH)
 
@@ -142,32 +155,29 @@ def load_config() -> Tuple[Dict[str, Any], bool]:
         except Exception as e:
             logger.error(f"解析配置文件时出错: {e}", exc_info=True)
 
-    app_cfg = {}
-    
-    # 步骤 1: 像以前一样，从 config.ini 加载所有配置
-    for key, (section, type, default) in CONFIG_DEFINITION.items():
+    # --- 从 config.ini 文件读取 ---
+    for key, (section, type, default) in BOOTSTRAP_CONFIG_DEF.items():
         if not config_parser.has_section(section):
             config_parser.add_section(section)
             
         if type == 'boolean':
+            # 特殊逻辑：如果是首次运行，强制开启认证
             if key == constants.CONFIG_OPTION_AUTH_ENABLED and is_first_run:
-                app_cfg[key] = True
+                bootstrap_config[key] = True
             else:
-                app_cfg[key] = config_parser.getboolean(section, key, fallback=default)
+                bootstrap_config[key] = config_parser.getboolean(section, key, fallback=default)
         elif type == 'int':
-            app_cfg[key] = config_parser.getint(section, key, fallback=default)
+            bootstrap_config[key] = config_parser.getint(section, key, fallback=default)
         elif type == 'float':
-            app_cfg[key] = config_parser.getfloat(section, key, fallback=default)
+            bootstrap_config[key] = config_parser.getfloat(section, key, fallback=default)
         elif type == 'list':
             value_str = config_parser.get(section, key, fallback=",".join(map(str, default)))
-            app_cfg[key] = [item.strip() for item in value_str.split(',') if item.strip()]
+            bootstrap_config[key] = [item.strip() for item in value_str.split(',') if item.strip()]
         else: # string
-            app_cfg[key] = config_parser.get(section, key, fallback=default)
+            bootstrap_config[key] = config_parser.get(section, key, fallback=default)
 
-    # ★★★ 步骤 2: 检查并应用环境变量覆盖 ★★★
+    # --- 使用环境变量覆盖数据库连接信息 ---
     logger.info("检查数据库环境变量...")
-    
-    # 定义环境变量和内部配置键的映射关系
     env_to_config_map = {
         constants.ENV_VAR_DB_HOST: constants.CONFIG_OPTION_DB_HOST,
         constants.ENV_VAR_DB_PORT: constants.CONFIG_OPTION_DB_PORT,
@@ -179,57 +189,83 @@ def load_config() -> Tuple[Dict[str, Any], bool]:
     for env_var, config_key in env_to_config_map.items():
         env_value = os.environ.get(env_var)
         if env_value:
-            # 如果环境变量存在，就覆盖掉从 config.ini 读到的值
             logger.info(f"检测到环境变量 '{env_var}'，将覆盖配置 '{config_key}'。")
-            # 特殊处理端口号，需要是整数
             if config_key == constants.CONFIG_OPTION_DB_PORT:
                 try:
-                    app_cfg[config_key] = int(env_value)
+                    bootstrap_config[config_key] = int(env_value)
                 except ValueError:
                     logger.error(f"环境变量 '{env_var}' 的值 '{env_value}' 不是一个有效的端口号，已忽略。")
             else:
-                app_cfg[config_key] = env_value
+                bootstrap_config[config_key] = env_value
 
-    APP_CONFIG = app_cfg.copy()
-    logger.info("全局配置 APP_CONFIG 已加载/更新。")
-    return app_cfg, is_first_run
+    # 将加载好的启动配置更新到全局配置中
+    APP_CONFIG.update(bootstrap_config)
+    logger.info("启动配置已加载。")
+
+    # ======================================================================
+    # 阶段 2: 加载动态应用配置 (从数据库)
+    # ======================================================================
+    try:
+        # 使用 'dynamic_app_config' 作为唯一的键来获取所有动态配置
+        dynamic_config_from_db = db_handler.get_setting('dynamic_app_config') or {}
+        
+        # 将数据库中的配置与 DYNAMIC_CONFIG_DEF 中定义的默认值合并
+        # 这样可以确保即使数据库中的配置不完整，或者未来代码中新增了配置项，程序也能正常工作
+        final_dynamic_config = {}
+        for key, (section, type, default) in DYNAMIC_CONFIG_DEF.items():
+            # 优先使用数据库中的值，如果不存在，则使用代码中定义的默认值
+            final_dynamic_config[key] = dynamic_config_from_db.get(key, default)
+
+        # 将加载好的动态配置也更新到全局配置中
+        APP_CONFIG.update(final_dynamic_config)
+        logger.info("动态应用配置已从数据库加载。")
+
+    except Exception as e:
+        # 如果连接数据库或读取setting失败，程序不能崩溃，必须用默认值继续运行
+        logger.error(f"从数据库加载动态配置失败: {e}。应用将使用默认的动态配置值。")
+        default_dynamic_config = {key: default for key, (section, type, default) in DYNAMIC_CONFIG_DEF.items()}
+        APP_CONFIG.update(default_dynamic_config)
+
+    logger.info("所有配置已加载完成。")
+    # 函数现在不再需要返回 is_first_run，因为这个状态只在函数内部使用
+    # 但为了保持函数签名不变，我们暂时保留它
+    return APP_CONFIG, is_first_run
 
 # --- 保存配置 ---
 def save_config(new_config: Dict[str, Any]):
-    """【清单驱动版】将配置保存到 config.ini，并更新全局 APP_CONFIG。"""
+    """
+    【V4 - 健壮的合并保存模式】
+    1. 从数据库加载当前完整的动态配置。
+    2. 将前端传入的新配置（可能不完整）合并到加载的配置中。
+    3. 将合并后的完整配置对象存回数据库，确保任何标签页的保存都不会丢失其他标签页的设置。
+    """
     global APP_CONFIG
-    config_parser = configparser.ConfigParser()
     
-    # 遍历配置清单，自动设置所有配置项
-    for key, (section, type, _) in CONFIG_DEFINITION.items():
-        if not config_parser.has_section(section):
-            config_parser.add_section(section)
-        
-        value = new_config.get(key)
-        
-        # 将值转换为适合写入ini文件的字符串格式
-        if isinstance(value, bool):
-            value_to_write = str(value).lower()
-        elif isinstance(value, list):
-            value_to_write = ",".join(map(str, value))
-        else:
-            value_to_write = str(value)
-        
-        # 处理百分号，防止 configparser 报错
-        value_to_write = value_to_write.replace('%', '%%')
-        config_parser.set(section, key, value_to_write)
-
     try:
-        with open(CONFIG_FILE_PATH, 'w', encoding='utf-8') as configfile:
-            config_parser.write(configfile)
+        # 步骤 1: 从数据库加载当前完整的动态配置，如果不存在则视为空字典
+        full_dynamic_config = db_handler.get_setting('dynamic_app_config') or {}
         
-        # 更新内存中的全局配置
-        APP_CONFIG = new_config.copy()
-        logger.info(f"配置已成功写入到 {CONFIG_FILE_PATH}，内存中的配置已同步。")
+        # 步骤 2: 将前端传入的新配置更新（合并）到这个完整的配置对象中
+        # 这确保了只更新变化的键，而不会丢失其他键
+        full_dynamic_config.update(new_config)
+        
+        # 步骤 3: (可选但推荐) 创建一个最终要保存的字典，确保只包含在 DYNAMIC_CONFIG_DEF 中定义的合法键
+        # 这样可以防止任何意外的键被存入数据库
+        dynamic_config_to_save = {
+            key: value
+            for key, value in full_dynamic_config.items()
+            if key in DYNAMIC_CONFIG_DEF
+        }
+        
+        # 步骤 4: 将这个合并后的、完整的、干净的配置对象作为一个整体存回数据库
+        db_handler.save_setting('dynamic_app_config', dynamic_config_to_save)
+        
+        # 步骤 5: 更新内存中的全局配置以立即生效
+        APP_CONFIG.update(dynamic_config_to_save)
+        logger.info("动态应用配置已成功合并保存到数据库，内存中的配置已同步。")
         
     except Exception as e:
-        logger.error(f"保存配置文件时失败: {e}", exc_info=True)
-        # 抛出异常，让调用者知道保存失败
+        logger.error(f"保存动态配置到数据库时失败: {e}", exc_info=True)
         raise
 
 # ★★★ 保存自定义主题 ★★★

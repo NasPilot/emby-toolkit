@@ -106,7 +106,34 @@
                           <div v-else style="font-size: 12px; color: #888;">提示：请从 Emby 后台用户管理页的地址栏复制 userId。</div>
                         </template>
                       </n-form-item-grid-item>
+                      <n-divider title-placement="left" style="margin: 10px 0;">管理员登录凭证 (用于删除等高级操作)</n-divider>
+                      <n-form-item-grid-item label="Emby 管理员用户名" path="emby_admin_user">
+                        <n-input v-model:value="configModel.emby_admin_user" placeholder="输入用于登录的管理员用户名" />
+                      </n-form-item-grid-item>
 
+                      <n-form-item-grid-item label="Emby 管理员密码" path="emby_admin_pass">
+                        <n-input 
+                          v-model:value="configModel.emby_admin_pass" 
+                          type="password" 
+                          show-password-on="click" 
+                          placeholder="输入对应的密码" 
+                        />
+                        <template #feedback>
+                          <n-text depth="3" style="font-size:0.8em;">
+                            此凭证仅用于执行删除媒体等需要临时令牌的高级操作，不会被用于常规扫描。
+                          </n-text>
+                        </template>
+                      </n-form-item-grid-item>
+
+                      <n-divider style="margin: 10px 0;" />
+                      <n-form-item-grid-item label="Emby API 超时时间 (秒)" path="emby_api_timeout">
+                        <n-input-number v-model:value="configModel.emby_api_timeout" :min="15" :step="5" placeholder="建议 30-90" style="width: 100%;" />
+                        <template #feedback>
+                          <n-text depth="3" style="font-size:0.8em;">
+                            当Emby服务器性能较差或媒体库巨大时，适当增加此值可防止网络请求失败。
+                          </n-text>
+                        </template>
+                      </n-form-item-grid-item>
                       <n-divider title-placement="left" style="margin-top: 10px;">选择要处理的媒体库</n-divider>
                       
                       <n-form-item-grid-item label-placement="top">
@@ -179,7 +206,7 @@
                         />
                         <template #feedback>
                           <n-text depth="3" style="font-size:0.8em;">
-                            填写独立的302重定向服务URL。网盘播放请求直接转发到此地址。
+                            填写独立的302重定向服务URL。所有视频播放请求直接转发到此地址。
                           </n-text>
                         </template>
                       </n-form-item-grid-item>
@@ -241,11 +268,40 @@
                     <n-form-item-grid-item label="MoviePilot URL" path="moviepilot_url"><n-input v-model:value="configModel.moviepilot_url" placeholder="例如: http://192.168.1.100:3000"/></n-form-item-grid-item>
                     <n-form-item-grid-item label="用户名" path="moviepilot_username"><n-input v-model:value="configModel.moviepilot_username" placeholder="输入 MoviePilot 的登录用户名"/></n-form-item-grid-item>
                     <n-form-item-grid-item label="密码" path="moviepilot_password"><n-input type="password" show-password-on="mousedown" v-model:value="configModel.moviepilot_password" placeholder="输入 MoviePilot 的登录密码"/></n-form-item-grid-item>
-                    <n-divider title-placement="left" style="margin-top: 20px; margin-bottom: 20px;">智能订阅设置</n-divider>
+                    
+                    <n-divider title-placement="left" style="margin-top: 20px; margin-bottom: 20px;">智能订阅与洗版</n-divider>
+                    
                     <n-form-item-grid-item label="启用智能订阅" path="autosub_enabled">
-                      <n-switch v-model:value="configModel.autosub_enabled" />
+                      <n-switch v-model:value="configModel.autosub_enabled" :disabled="!isMoviePilotConfigured" />
                       <template #feedback><n-text depth="3" style="font-size:0.8em;">总开关。开启后，智能订阅定时任务才会真正执行订阅操作。</n-text></template>
                     </n-form-item-grid-item>
+
+                    <n-form-item-grid-item label="对缺集的已完结剧集触发洗版" path="resubscribe_completed_on_missing">
+                      <n-switch v-model:value="configModel.resubscribe_completed_on_missing" :disabled="!isMoviePilotConfigured" />
+                      <template #feedback><n-text depth="3" style="font-size:0.8em;">开启后，“洗版缺集的季”任务会检查所有已完结剧集，若本地文件不完整，则向MoviePilot提交整季的洗版订阅 。</n-text></template>
+                    </n-form-item-grid-item>
+
+                    <!-- ★★★ 核心修改：在这里添加阀门设置 ★★★ -->
+                    <n-divider title-placement="left" style="margin-top: 20px; margin-bottom: 20px;">每日订阅额度</n-divider>
+
+                    <n-form-item-grid-item label="每日订阅上限" path="resubscribe_daily_cap">
+                      <n-input-number v-model:value="configModel.resubscribe_daily_cap" :min="1" :disabled="!isMoviePilotConfigured" />
+                      <template #feedback>
+                        <n-text depth="3" style="font-size:0.8em;">
+                          若每日订阅的项目超过此数量，任务将自动中止，每天0点重置。
+                        </n-text>
+                      </template>
+                    </n-form-item-grid-item>
+
+                    <n-form-item-grid-item label="订阅请求间隔 (秒)" path="resubscribe_delay_seconds">
+                      <n-input-number v-model:value="configModel.resubscribe_delay_seconds" :min="0.1" :step="0.1" :disabled="!isMoviePilotConfigured" />
+                      <template #feedback>
+                        <n-text depth="3" style="font-size:0.8em;">
+                          每次成功提交订阅后，等待指定的秒数再提交下一个，以避免对MoviePilot服务器造成冲击。
+                        </n-text>
+                      </template>
+                    </n-form-item-grid-item>
+
                   </n-card>
                 </n-gi>
               </n-grid>
@@ -450,7 +506,7 @@
 </template>
 
 <script setup>
-import { ref, watch, computed, onMounted, onUnmounted, nextTick } from 'vue'; 
+import { ref, watch, computed, onMounted, onUnmounted, nextTick, isShallow } from 'vue'; 
 import draggable from 'vuedraggable';
 import { 
   NCard, NForm, NFormItem, NInputNumber, NSwitch, NButton, NGrid, NGi, 
@@ -470,18 +526,21 @@ import { useConfig } from '../../composables/useConfig.js';
 import axios from 'axios';
 
 const tableInfo = {
+  'app_settings': { cn: '基础配置', isSharable: false },
   'person_identity_map': { cn: '演员身份映射表', isSharable: false },
   'actor_metadata': { cn: '演员元数据', isSharable: false },
   'translation_cache': { cn: '翻译缓存', isSharable: false },
   'watchlist': { cn: '追剧列表', isSharable: false },
   'actor_subscriptions': { cn: '演员订阅配置', isSharable: false },
   'tracked_actor_media': { cn: '已追踪的演员作品', isSharable: false },
-  'collections_info': { cn: '电影合集信息', isSharable: false },
+  'collections_info': { cn: '原生合集', isSharable: false },
   'processed_log': { cn: '已处理日志', isSharable: false },
   'failed_log': { cn: '待复核日志', isSharable: false },
   'users': { cn: '用户账户', isSharable: false },
   'custom_collections': { cn: '自建合集', isSharable: false },
   'media_metadata': { cn: '媒体元数据', isSharable: false },
+  'resubscribe_rules': { cn: '媒体洗版规则', isSharable: false },
+  'resubscribe_cache': { cn: '媒体洗版缓存', isSharable: false },
 };
 
 // ★★★ START: 新增的依赖关系自动勾选逻辑 ★★★
@@ -622,6 +681,16 @@ const embyUserIdRule = {
     return true;
   }
 };
+
+// ★★★ 新增计算属性，用于判断 MoviePilot 是否配置完整 ★★★
+const isMoviePilotConfigured = computed(() => {
+  if (!configModel.value) return false;
+  return !!(
+    configModel.value.moviepilot_url &&
+    configModel.value.moviepilot_username &&
+    configModel.value.moviepilot_password
+  );
+});
 
 // ★★★ 新增：测试代理连接的方法 ★★★
 const testProxy = async () => {
@@ -819,28 +888,41 @@ const save = async () => {
   try {
     await formRef.value?.validate();
 
-    // ▼▼▼ 修改点3: 增加 emby_server_url 到重启检查列表 ▼▼▼
+    // ▼▼▼ 核心修正：在这里创建一个干净的、临时的配置对象副本 ▼▼▼
+    // 使用 JSON.parse(JSON.stringify(...)) 是一个简单有效的深拷贝方法，
+    // 它可以断开所有响应式引用，得到一个纯净的 JavaScript 对象。
+    const cleanConfigPayload = JSON.parse(JSON.stringify(configModel.value));
+    
+    // ★★★ 关键净化步骤 ★★★
+    // 无论 configModel 内部发生了什么污染，我们在这里强制用当前组件的
+    // v-model 的值来覆盖 payload 中对应的字段，确保其绝对正确。
+    // 这一步看似多余，但它正是修复这个隐蔽BUG的关键。
+    if (configModel.value) {
+        cleanConfigPayload.libraries_to_process = configModel.value.libraries_to_process;
+        cleanConfigPayload.proxy_native_view_selection = configModel.value.proxy_native_view_selection;
+    }
+    // ▲▲▲ 修正结束 ▲▲▲
+
     const restartNeeded =
       initialRestartableConfig.value && (
-        configModel.value.proxy_port !== initialRestartableConfig.value.proxy_port ||
-        configModel.value.proxy_302_redirect_url !== initialRestartableConfig.value.proxy_302_redirect_url ||
-        configModel.value.log_rotation_size_mb !== initialRestartableConfig.value.log_rotation_size_mb ||
-        configModel.value.log_rotation_backup_count !== initialRestartableConfig.value.log_rotation_backup_count ||
-        configModel.value.emby_server_url !== initialRestartableConfig.value.emby_server_url
+        cleanConfigPayload.proxy_port !== initialRestartableConfig.value.proxy_port ||
+        cleanConfigPayload.proxy_302_redirect_url !== initialRestartableConfig.value.proxy_302_redirect_url ||
+        cleanConfigPayload.log_rotation_size_mb !== initialRestartableConfig.value.log_rotation_size_mb ||
+        cleanConfigPayload.log_rotation_backup_count !== initialRestartableConfig.value.log_rotation_backup_count ||
+        cleanConfigPayload.emby_server_url !== initialRestartableConfig.value.emby_server_url
       );
 
-    // 封装保存操作，以便复用
     const performSaveAndUpdateState = async () => {
-      const success = await handleSaveConfig();
+      // ▼▼▼ 核心修正：将净化后的 cleanConfigPayload 传递给保存函数 ▼▼▼
+      const success = await handleSaveConfig(cleanConfigPayload);
       if (success) {
         message.success('所有设置已成功保存！');
-        // ▼▼▼ 修改点4: 更新初始状态时也包含 emby_server_url ▼▼▼
         initialRestartableConfig.value = {
-          proxy_port: configModel.value.proxy_port,
-          proxy_302_redirect_url: configModel.value.proxy_302_redirect_url,
-          log_rotation_size_mb: configModel.value.log_rotation_size_mb,
-          log_rotation_backup_count: configModel.value.log_rotation_backup_count,
-          emby_server_url: configModel.value.emby_server_url,
+          proxy_port: cleanConfigPayload.proxy_port,
+          proxy_302_redirect_url: cleanConfigPayload.proxy_302_redirect_url,
+          log_rotation_size_mb: cleanConfigPayload.log_rotation_size_mb,
+          log_rotation_backup_count: cleanConfigPayload.log_rotation_backup_count,
+          emby_server_url: cleanConfigPayload.emby_server_url,
         };
       } else {
         message.error(configError.value || '配置保存失败，请检查后端日志。');
@@ -865,7 +947,6 @@ const save = async () => {
         }
       });
     } else {
-      // 如果无需重启，则直接保存
       await performSaveAndUpdateState();
     }
   } catch (errors) {

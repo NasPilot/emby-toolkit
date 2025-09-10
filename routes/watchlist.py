@@ -216,12 +216,16 @@ def api_subscribe_series_to_moviepilot():
     tmdb_id = data.get('tmdb_id')
     title = data.get('title')
     season_number = data.get('season_number')
-
     # 校验输入参数
     if not all([tmdb_id, title, season_number is not None]):
         return jsonify({"error": "请求参数无效，必须提供 tmdb_id, title 和 season_number。"}), 400
-
     logger.info(f"API: 收到对《{title}》第 {season_number} 季 (TMDb ID: {tmdb_id}) 的 MoviePilot 订阅请求。")
+
+    # --- 新增配额检查 ---
+    current_quota = db_handler.get_subscription_quota()
+    if current_quota <= 0:
+        logger.warning(f"API: 用户尝试订阅《{title}》第 {season_number} 季，但每日配额已用尽。")
+        return jsonify({"error": "今日订阅配额已用尽，请明天再试。"}), 429
 
     try:
         # 准备需要传递给 handler 的信息
@@ -236,12 +240,13 @@ def api_subscribe_series_to_moviepilot():
             season_number=season_number,
             config=config_manager.APP_CONFIG
         )
-
         if success:
+            # 订阅成功后扣减配额
+            db_handler.decrement_subscription_quota()
+
             return jsonify({"message": f"《{title}》第 {season_number} 季的订阅任务已成功提交到 MoviePilot！"}), 200
         else:
             return jsonify({"error": "提交订阅到 MoviePilot 失败，请检查 MoviePilot 的日志。"}), 500
-
     except Exception as e:
         logger.error(f"订阅剧集到 MoviePilot 时发生未知错误: {e}", exc_info=True)
         return jsonify({"error": "订阅时发生未知的服务器内部错误。"}), 500

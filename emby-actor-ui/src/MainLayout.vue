@@ -2,7 +2,14 @@
   <n-layout style="height: 100vh;">
     <n-layout-header :bordered="false" class="app-header">
       <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
-        <span class="text-effect">Emby Toolkit</span>
+        <span class="text-effect">
+          <img
+            :src="logo"
+            alt="Logo"
+            style="height: 1.5em; vertical-align: middle; margin-right: 0.3em;"
+          />
+          Emby Toolkit
+        </span>
           <div style="display: flex; align-items: center; gap: 16px;">
             <!-- 用户名下拉菜单 -->
             <n-dropdown 
@@ -162,10 +169,12 @@ import {
   Stop as StopIcon,
   ShuffleOutline as ShuffleIcon,
   SyncOutline as RestartIcon,
+  SparklesOutline as ResubscribeIcon,
 } from '@vicons/ionicons5';
 import { Password24Regular as PasswordIcon } from '@vicons/fluent';
 import axios from 'axios';
 import { useMessage, useDialog } from 'naive-ui';
+import logo from './assets/logo.png'
 
 const message = useMessage();
 const dialog = useDialog();
@@ -253,7 +262,7 @@ const handleUserSelect = async (key) => {
 const menuOptions = computed(() => [
   { label: '发现', key: 'group-discovery', type: 'group', children: [ { label: '数据看板', key: 'DatabaseStats', icon: renderIcon(StatsIcon) } ] },
   { label: '整理', key: 'group-management', type: 'group', children: [ { label: '原生合集', key: 'Collections', icon: renderIcon(CollectionsIcon) }, { label: '自建合集', key: 'CustomCollectionsManager', icon: renderIcon(CustomCollectionsIcon) }, { label: '封面生成', key: 'CoverGeneratorConfig', icon: renderIcon(PaletteIcon) }, { label: '手动处理', key: 'ReviewList', icon: renderIcon(ReviewListIcon) }, ] },
-  { label: '订阅', key: 'group-subscriptions', type: 'group', children: [ { label: '智能追剧', key: 'Watchlist', icon: renderIcon(WatchlistIcon) }, { label: '演员订阅', key: 'ActorSubscriptions', icon: renderIcon(ActorSubIcon) }, ] },
+  { label: '订阅', key: 'group-subscriptions', type: 'group', children: [ { label: '智能追剧', key: 'Watchlist', icon: renderIcon(WatchlistIcon) }, { label: '演员订阅', key: 'ActorSubscriptions', icon: renderIcon(ActorSubIcon) }, { label: '媒体洗版', key: 'ResubscribePage', icon: renderIcon(ResubscribeIcon) }, ] },
   { label: '系统', key: 'group-system', type: 'group', children: [ { label: '通用设置', key: 'settings-general', icon: renderIcon(GeneralIcon) }, { label: '任务中心', key: 'settings-scheduler', icon: renderIcon(SchedulerIcon) }, { label: '查看更新', key: 'Releases', icon: renderIcon(AboutIcon) }, ] }
 ]);
 

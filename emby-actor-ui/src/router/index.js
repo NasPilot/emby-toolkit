@@ -95,6 +95,12 @@ const routes = [
     component: CoverGeneratorConfig,
     meta: { title: '封面生成设置' } // 用于浏览器标签页标题
   },
+  {
+    path: '/resubscribe',
+    name: 'ResubscribePage',
+    component: () => import('../components/ResubscribePage.vue'),
+    meta: { requiresAuth: true, title: '媒体洗版' },
+  },
 ];
 
 // --- 3. 创建路由实例 (这部分保持不变) ---

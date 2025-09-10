@@ -3,7 +3,7 @@
 # ==============================================================================
 # ✨ 应用基础信息 (Application Basics)
 # ==============================================================================
-APP_VERSION = "3.7.4"  # 更新版本号
+APP_VERSION = "3.9.9"  # 更新版本号
 GITHUB_REPO_OWNER = "hbq0405"  # 您的 GitHub 用户名
 GITHUB_REPO_NAME = "emby-toolkit" # 您的 GitHub 仓库名
 DEBUG_MODE = True     # 开发模式开关，部署时应设为 False
@@ -36,8 +36,6 @@ CONFIG_OPTION_PROXY_MERGE_NATIVE = "proxy_merge_native_libraries"
 CONFIG_OPTION_PROXY_NATIVE_VIEW_SELECTION = "proxy_native_view_selection"  # List[str]
 CONFIG_OPTION_PROXY_NATIVE_VIEW_ORDER = "proxy_native_view_order"  # str, 'before' or 'after'
 CONFIG_OPTION_PROXY_302_REDIRECT_URL = "proxy_302_redirect_url"
-CONFIG_OPTION_PROXY_MERGE_NATIVE = "proxy_merge_native_libraries"
-CONFIG_OPTION_PROXY_NATIVE_VIEW_SELECTION = "proxy_native_view_selection"  # List[str]
 CONFIG_OPTION_PROXY_NATIVE_VIEW_ORDER = "proxy_native_view_order"  # str, 'before' or 'after'
 
 # ==============================================================================
@@ -47,7 +45,10 @@ CONFIG_SECTION_EMBY = "Emby"
 CONFIG_OPTION_EMBY_SERVER_URL = "emby_server_url"       # Emby服务器地址
 CONFIG_OPTION_EMBY_API_KEY = "emby_api_key"             # Emby API密钥
 CONFIG_OPTION_EMBY_USER_ID = "emby_user_id"             # 用于操作的Emby用户ID
+CONFIG_OPTION_EMBY_API_TIMEOUT = "emby_api_timeout"     # Emby API 超时时间 
 CONFIG_OPTION_EMBY_LIBRARIES_TO_PROCESS = "libraries_to_process" # 需要处理的媒体库名称列表
+CONFIG_OPTION_EMBY_ADMIN_USER = "emby_admin_user"       # (可选) 用于自动登录获取令牌的管理员用户名
+CONFIG_OPTION_EMBY_ADMIN_PASS = "emby_admin_pass"       # (可选) 用于自动登录获取令牌的管理员密码
 
 # ==============================================================================
 # ✨ 数据处理流程配置 (Processing Workflow)
@@ -87,6 +88,9 @@ CONFIG_OPTION_MOVIEPILOT_USERNAME = "moviepilot_username"
 CONFIG_OPTION_MOVIEPILOT_PASSWORD = "moviepilot_password"
 # --- 智能订阅相关配置 ---
 CONFIG_OPTION_AUTOSUB_ENABLED = "autosub_enabled" # 智能订阅总开关
+CONFIG_OPTION_RESUBSCRIBE_COMPLETED_ON_MISSING = "resubscribe_completed_on_missing"
+CONFIG_OPTION_RESUBSCRIBE_DAILY_CAP = "resubscribe_daily_cap"
+CONFIG_OPTION_RESUBSCRIBE_DELAY_SECONDS = "resubscribe_delay_seconds"
 
 # --- AI 翻译 ---
 CONFIG_SECTION_AI_TRANSLATION = "AITranslation"

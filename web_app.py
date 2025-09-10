@@ -61,12 +61,14 @@ from routes.auth import auth_bp, init_auth as init_auth_from_blueprint
 from routes.actions import actions_bp
 from routes.cover_generator_config import cover_generator_config_bp
 from routes.tasks import tasks_bp
+from routes.resubscribe import resubscribe_bp
 # --- 核心模块导入 ---
 import constants # 你的常量定义\
 import logging
 from logger_setup import frontend_log_queue, add_file_handler # 日志记录器和前端日志队列
 import utils       # 例如，用于 /api/search_media
 import config_manager
+
 import task_manager
 # --- 核心模块导入结束 ---
 logger = logging.getLogger(__name__)
@@ -157,6 +159,14 @@ def init_db():
                         original_text TEXT PRIMARY KEY, 
                         translated_text TEXT, 
                         engine_used TEXT, 
+                        last_updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                    )
+                """)
+
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS app_settings (
+                        setting_key TEXT PRIMARY KEY,
+                        value_json JSONB,
                         last_updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
                     )
                 """)
@@ -310,6 +320,65 @@ def init_db():
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_tam_subscription_id ON tracked_actor_media (subscription_id)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_tam_status ON tracked_actor_media (status)")
 
+                try:
+                    logger.warning("  -> [数据库升级] 正在删除旧的 'resubscribe_settings' 表...")
+                    cursor.execute("DROP TABLE IF EXISTS resubscribe_settings CASCADE;")
+                    logger.info("  -> [数据库升级] 旧表 'resubscribe_settings' 已成功删除。")
+                except Exception as e_drop:
+                    logger.error(f"  -> [数据库升级] 删除旧表 'resubscribe_settings' 时出错（可能已不存在）: {e_drop}")
+                
+                logger.trace("  -> 正在创建 'resubscribe_rules' 表 (多规则洗版)...")
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS resubscribe_rules (
+                        id SERIAL PRIMARY KEY,
+                        name TEXT NOT NULL UNIQUE,
+                        enabled BOOLEAN DEFAULT TRUE,
+                        
+                        -- ★ 新增：规则应用的目标媒体库ID列表
+                        target_library_ids JSONB, 
+                        
+                        -- ★ 新增：洗版成功后是否删除Emby媒体项
+                        delete_after_resubscribe BOOLEAN DEFAULT FALSE,
+                        
+                        -- ★ 新增：规则优先级，数字越小越优先
+                        sort_order INTEGER DEFAULT 0,
+
+                        -- ▼ 下面是原来 settings 表里的所有字段
+                        resubscribe_resolution_enabled BOOLEAN DEFAULT FALSE,
+                        resubscribe_resolution_threshold INT DEFAULT 1920,
+                        resubscribe_audio_enabled BOOLEAN DEFAULT FALSE,
+                        resubscribe_audio_missing_languages JSONB,
+                        resubscribe_subtitle_enabled BOOLEAN DEFAULT FALSE,
+                        resubscribe_subtitle_missing_languages JSONB,
+                        resubscribe_quality_enabled BOOLEAN DEFAULT FALSE,
+                        resubscribe_quality_include JSONB,
+                        resubscribe_effect_enabled BOOLEAN DEFAULT FALSE,
+                        resubscribe_effect_include JSONB
+                    )
+                """)
+
+                logger.trace("  -> 正在创建 'resubscribe_cache' 表...")
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS resubscribe_cache (
+                        item_id TEXT PRIMARY KEY,
+                        item_name TEXT,
+                        tmdb_id TEXT,
+                        item_type TEXT,
+                        status TEXT DEFAULT 'unknown', -- 新增状态字段: 'ok', 'needed', 'subscribed'
+                        reason TEXT,
+                        resolution_display TEXT,
+                        quality_display TEXT,
+                        effect_display TEXT,
+                        audio_display TEXT,
+                        subtitle_display TEXT,
+                        audio_languages_raw JSONB,
+                        subtitle_languages_raw JSONB,
+                        last_checked_at TIMESTAMP WITH TIME ZONE,
+                        source_library_id TEXT
+                    )
+                """)
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_resubscribe_cache_status ON resubscribe_cache (status);")
+
                 # --- 2. 执行平滑升级检查 ---
                 logger.info("  -> 开始执行数据库表结构平滑升级检查...")
                 try:
@@ -336,9 +405,14 @@ def init_db():
                             "official_rating": "TEXT",
                             "unified_rating": "TEXT"
                         },
-                        # 'custom_collections': {
-                        #     "emby_playlist_id": "TEXT"
-                        # }
+                        'watchlist': {
+                            "last_episode_to_air_json": "JSONB"
+                        },
+                        'resubscribe_cache': {
+                            "matched_rule_id": "INTEGER",
+                            "matched_rule_name": "TEXT",
+                            "source_library_id": "TEXT"
+                        }
                     }
 
                     # --- 2.3 遍历并执行升级 ---
@@ -363,6 +437,28 @@ def init_db():
                     logger.error(f"  -> [数据库升级] 检查或添加新字段时出错: {e_alter}", exc_info=True)
                     # 即使升级失败，也继续执行，不中断主程序启动
                 
+                try:
+                    # 检查 resubscribe_cache 表上是否已存在名为 fk_matched_rule 的外键
+                    cursor.execute("""
+                        SELECT 1 FROM pg_constraint 
+                        WHERE conname = 'fk_matched_rule' AND conrelid = 'resubscribe_cache'::regclass;
+                    """)
+                    if cursor.fetchone() is None:
+                        logger.info("    -> [数据库升级] 检测到 'resubscribe_cache' 表缺少外键，正在添加...")
+                        # ON DELETE SET NULL: 如果规则被删除，缓存项的 matched_rule_id 会被设为 NULL，而不是删除缓存项
+                        cursor.execute("""
+                            ALTER TABLE resubscribe_cache 
+                            ADD CONSTRAINT fk_matched_rule 
+                            FOREIGN KEY (matched_rule_id) 
+                            REFERENCES resubscribe_rules(id) 
+                            ON DELETE SET NULL;
+                        """)
+                        logger.info("    -> [数据库升级] 外键 'fk_matched_rule' 添加成功。")
+                    else:
+                        logger.trace("    -> 外键 'fk_matched_rule' 已存在，跳过。")
+                except Exception as e_fk:
+                     logger.error(f"  -> [数据库升级] 检查或添加外键时出错: {e_fk}", exc_info=True)
+
                 logger.info("  -> 数据库平滑升级检查完成。")
 
             conn.commit()
@@ -535,6 +631,7 @@ def ensure_cover_generator_fonts():
                     logger.error(f"拷贝字体文件 {font_name} 失败: {e}", exc_info=True)
             else:
                 logger.warning(f"项目根目录缺少字体文件 {font_name}，无法拷贝至 {cover_fonts_dir}")
+
 
 # --- 应用退出处理 ---
 def application_exit_handler():
@@ -777,6 +874,7 @@ app.register_blueprint(auth_bp)
 app.register_blueprint(actions_bp)
 app.register_blueprint(cover_generator_config_bp)
 app.register_blueprint(tasks_bp)
+app.register_blueprint(resubscribe_bp)
 
 def main_app_start():
     """将主应用启动逻辑封装成一个函数"""
@@ -798,7 +896,7 @@ def main_app_start():
     add_file_handler(log_directory=config_manager.LOG_DIRECTORY, log_size_mb=log_size, log_backups=log_backups)
     
     init_db()
-    # ensure_nginx_config() # <-- ★★★ 核心修改 1: 这行不再需要在这里调用 ★★★
+
     ensure_cover_generator_fonts()
     init_auth_from_blueprint()
     initialize_processors()

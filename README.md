@@ -1,4 +1,4 @@
-# Emby ToolKit (Emby 演员管理工具)
+# Emby ToolKit (Emby 增强管理工具)
 
 [![GitHub stars](https://img.shields.io/github/stars/hbq0405/emby-toolkit.svg%sstyle=social&label=Star)](https://github.com/hbq0405/emby-toolkit)
 [![GitHub license](https://img.shields.io/github/license/hbq0405/emby-toolkit.svg)](https://github.com/hbq0405/emby-toolkit/blob/main/LICENSE)
@@ -11,7 +11,7 @@
 *   **演员信息处理**：自动翻译演员名、角色名、优先使用豆瓣角色名，没有的调用ai在线翻译。
 *   **外部数据源集成**：从豆瓣获取Tmdb缺失的演员，补充进演员表。
 *   **定时任务**：支持定时自动化按设置的顺序执行后台任务。
-*   **实时处理新入库资源**：自动处理Emby新入库资源，需配置webhook:http://ip:5257/webhook/emby 请求内容类型：application/json 勾选：【新媒体已添加】以及神医插件才有的【按剧集和专辑对通知进行分组】、【媒体元数据更新】、【媒体图像更新】。
+*   **实时处理新入库资源**：自动处理Emby新入库资源，需配置webhook:http://ip:5257/webhook/emby 请求内容类型：application/json 勾选：【新媒体已添加】、【媒体删除】以及神医插件才有的【按剧集和专辑对通知进行分组】、【媒体元数据更新】、【媒体图像更新】。
 *   **合集检查**：扫描库存合集，检查缺失并订阅（需配置MoviePilot）。
 *   **智能追剧**：监控媒体库所有剧集，智能判断并更新状态，对缺失的季以及新出的季进行订阅操作（需配置MoviePilot）。
 *   **演员订阅**：追踪喜欢的演员，按配置订阅过去以及将来的资源（需配置MoviePilot）。
@@ -49,8 +49,7 @@
       emby-toolkit:
         image: hbq0405/emby-toolkit:latest 
         container_name: emby-toolkit
-        networks:
-          - emby-net                                  # 容器内部网络，外接数据库的可以任意配置网络模式
+        network_mode: bridge                          # 网络模式
         ports:
           - "5257:5257"                               # 管理端口
           - "8097:8097"                               # 反代端口，虚拟库用，冒号前面是实际访问端口，冒号后面是管理后台设置的反代监听端口
@@ -65,7 +64,7 @@
           - PUID=1000                                 # 设置为你的用户ID，建议与宿主机用户ID保持一致
           - PGID=1000                                 # 设置为DOCKER组ID (一键更新用，‘grep docker /etc/group’可以查询)
           - UMASK=022                                 # 设置文件权限掩码，建议022
-          - DB_HOST=db                                # 数据库服务的主机名 
+          - DB_HOST=172.17.0.1                        # 数据库服务的地址 
           - DB_PORT=5432                              # 数据库服务的端口 
           - DB_USER=embytoolkit                       # !!! (可选) 修改为你自己的数据库用户名
           - DB_PASSWORD=embytoolkit                   # !!! (必填) 请修改为一个强密码 !!!
@@ -77,12 +76,11 @@
           db:
             condition: service_healthy
       # --- 2. PostgreSQL 数据库服务 ---
-      db:
+      postgres:
         image: postgres:16-alpine
         container_name: emby-toolkit-db
         restart: unless-stopped
-        networks:
-          - emby-net
+        network_mode: bridge
         volumes:
           # 将数据库的持久化数据存储在名为 'postgres_data' 的Docker卷中
           # 这可以确保即使删除了容器，数据库数据也不会丢失
@@ -102,9 +100,6 @@
           interval: 10s
           timeout: 5s
           retries: 5
-    networks:
-      emby-net:
-        driver: bridge                                # 创建一个容器内部网络
     volumes:
       postgres_data:                                  # 创建一个Docker卷持久化保存数据库数据
 

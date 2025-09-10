@@ -151,19 +151,10 @@ const resetConfig = () => {
 
   // 使用加载到的数据填充表单的 v-model
   editableConfig.value = {
-    // 正确地从 config.start_year 读取
     start_year: config.start_year || 1900,
-    
-    // 正确地从 config.media_types 读取 (后端已返回数组，无需 split)
     media_types: config.media_types || ['Movie', 'TV'],
-    
-    // 正确地从 config.genres_include_json 读取 (后端已返回数组)
-    genres_include: config.genres_include_json || [],
-    
-    // 正确地从 config.genres_exclude_json 读取 (后端已返回数组)
-    genres_exclude: config.genres_exclude_json || [],
-    
-    // 正确地从 config.min_rating 读取
+    genres_include_json: config.genres_include_json || [],
+    genres_exclude_json: config.genres_exclude_json || [],
     min_rating: config.min_rating || 6.0,
   };
 };
@@ -171,23 +162,9 @@ const resetConfig = () => {
 const saveConfig = async () => {
   if (!props.subscriptionId) return;
   try {
-    // ★★★ 核心修复：创建一个新的 payload 对象，确保其键名与后端完全匹配 ★★★
     const payload = {
-      config: {
-        // 这些字段的键名已经是正确的，直接复制
-        start_year: editableConfig.value.start_year,
-        media_types: editableConfig.value.media_types,
-        min_rating: editableConfig.value.min_rating,
-
-        // 将前端的 'genres_include' 映射到后端期望的 'genres_include_json'
-        genres_include_json: editableConfig.value.genres_include,
-
-        // 将前端的 'genres_exclude' 映射到后端期望的 'genres_exclude_json'
-        genres_exclude_json: editableConfig.value.genres_exclude,
-      }
+      config: editableConfig.value
     };
-
-    // 发送这个完美匹配后端需求的 payload
     await axios.put(`/api/actor-subscriptions/${props.subscriptionId}`, payload);
     
     message.success('配置已成功保存！');

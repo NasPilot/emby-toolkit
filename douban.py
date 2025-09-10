@@ -465,6 +465,32 @@ class DoubanApi:
         logger.debug(f"获取豆瓣演员详情: {detail_url}")
         details = self.__invoke(detail_url)
         return details
+    
+    # ▼▼▼ 通过豆瓣链接获取其对应的IMDb ID ▼▼▼
+    def get_details_from_douban_link(self, douban_link: str, mtype: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        【V3 - 增强版】专门通过豆瓣链接获取其完整的详情信息字典。
+        """
+        logger.debug(f"  -> 专用函数：尝试从豆瓣链接 '{douban_link}' 获取完整详情...")
+        match = re.search(r'/(?:movie|tv|subject)/(\d+)', douban_link)
+        if not match:
+            logger.warning(f"  -> 无法从链接中解析出豆瓣ID。")
+            return None
+
+        douban_id = match.group(1)
+        
+        primary_type = 'tv' if mtype and mtype.lower() in ['series', 'tv'] else 'movie'
+        secondary_type = 'movie' if primary_type == 'tv' else 'tv'
+
+        details = self._get_subject_details(douban_id, primary_type)
+        if details.get("error"):
+            logger.trace(f"  -> 使用主类型 '{primary_type}' 获取详情失败，尝试备用类型 '{secondary_type}'...")
+            details = self._get_subject_details(douban_id, secondary_type)
+
+        if details.get("error"):
+            logger.error(f"  -> 无法获取豆瓣ID '{douban_id}' 的详情: {details.get('message')}")
+            return None # 如果有错误，返回 None
+        return details # 成功时返回完整的 details 字典
 
 if __name__ == '__main__':
     # 测试代码现在不再需要创建数据库文件

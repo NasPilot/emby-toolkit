@@ -1,12 +1,13 @@
 # db_handler.py
 import psycopg2
 from psycopg2 import sql
-from psycopg2.extras import RealDictCursor # 关键：让查询结果返回字典
+from psycopg2.extras import RealDictCursor, Json
 import json
+import pytz
 import logging
 from typing import Optional, Dict, Any, List, Tuple
 from flask import jsonify
-
+from datetime import datetime, timezone
 # 核心模块导入
 import config_manager
 import emby_handler
@@ -203,14 +204,22 @@ class ActorDBManager:
                             "将执行彻底清理..."
                         )
 
-                        # 1. 清理数据库
+                        # 1. 在更新父表之前，先安全地删除子表中的依赖记录
+                        if db_column == "tmdb_person_id":
+                            logger.info(f"  -> 正在从 'actor_metadata' 表中删除对 TMDB ID '{id_value}' 的依赖...")
+                            cursor.execute(
+                                "DELETE FROM actor_metadata WHERE tmdb_id = %s",
+                                (id_value,)
+                            )
+
+                        # 2. 清理数据库
                         logger.info(f"  -> 正在从数据库中清除所有 '{id_value}'...")
                         cursor.execute(
                             f"UPDATE person_identity_map SET {db_column} = NULL, last_updated_at = NOW() WHERE {db_column} = %s",
                             (id_value,)
                         )
 
-                        # 2. 清理 Emby
+                        # 3. 清理 Emby
                         logger.info(f"  -> 正在从Emby中清除所有关联演员的 '{emby_provider_key}' ID...")
                         for pid in conflicting_emby_pids:
                             emby_handler.clear_emby_person_provider_id(
@@ -286,7 +295,40 @@ class ActorDBManager:
             cursor.execute("ROLLBACK TO SAVEPOINT actor_upsert")
             logger.error(f"upsert_person 未知异常，emby_person_id={person_data.get('emby_id')}: {e}", exc_info=True)
             return -1, "ERROR"
-        
+
+# --- 演员映射表清理 ---
+def get_all_emby_person_ids_from_map() -> set:
+    """从 person_identity_map 表中获取所有 emby_person_id 的集合。"""
+    ids = set()
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT emby_person_id FROM person_identity_map")
+            rows = cursor.fetchall()
+            for row in rows:
+                ids.add(row['emby_person_id'])
+        return ids
+    except Exception as e:
+        logger.error(f"DB: 获取所有演员映射Emby ID时失败: {e}", exc_info=True)
+        raise
+
+def delete_persons_by_emby_ids(emby_ids: list) -> int:
+    """根据 Emby Person ID 列表，从 person_identity_map 表中批量删除记录。"""
+    if not emby_ids:
+        return 0
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            # 使用 ANY(%s) 语法可以高效地处理列表删除
+            sql = "DELETE FROM person_identity_map WHERE emby_person_id = ANY(%s)"
+            cursor.execute(sql, (emby_ids,))
+            deleted_count = cursor.rowcount
+            conn.commit()
+            logger.info(f"DB: 成功从演员映射表中删除了 {deleted_count} 条陈旧记录。")
+            return deleted_count
+    except Exception as e:
+        logger.error(f"DB: 批量删除陈旧演员映射时失败: {e}", exc_info=True)
+        raise
 # ======================================================================
 # 模块 3: 日志表数据访问 (Log Tables Data Access)
 # ======================================================================
@@ -1632,7 +1674,7 @@ def update_single_media_status_in_custom_collection(collection_id: int, media_tm
         raise
 
 # --- 更新榜单合集 ---
-def match_and_update_list_collections_on_item_add(new_item_tmdb_id: str, new_item_name: str) -> List[Dict[str, Any]]:
+def match_and_update_list_collections_on_item_add(new_item_tmdb_id: str, new_item_emby_id: str, new_item_name: str) -> List[Dict[str, Any]]:
     """
     【V3 - PG JSONB 查询修复版】
     当新媒体入库时，查找所有匹配的'list'类型合集，更新其内部状态，并返回需要被操作的Emby合集信息。
@@ -1689,6 +1731,7 @@ def match_and_update_list_collections_on_item_add(new_item_tmdb_id: str, new_ite
                                 logger.info(f"  -> 数据库状态更新：项目《{new_item_name}》在合集《{collection_name}》中的状态将从【{old_status_cn}】更新为【{new_status_cn}】。")
                                 
                                 media_item['status'] = new_status_key
+                                media_item['emby_id'] = new_item_emby_id 
                                 item_found_and_updated = True
                                 break
                         
@@ -1728,3 +1771,499 @@ def match_and_update_list_collections_on_item_add(new_item_tmdb_id: str, new_ite
     except psycopg2.Error as e_db:
         logger.error(f"匹配和更新榜单合集时发生数据库错误: {e_db}", exc_info=True)
         raise
+def get_media_metadata_by_tmdb_ids(tmdb_ids: List[str], item_type: str) -> List[Dict[str, Any]]:
+    """
+    根据一个 TMDb ID 列表，从媒体元数据缓存表中批量获取记录。
+    """
+    if not tmdb_ids:
+        return []
+    
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            # 使用 ANY(%s) 语法可以高效地查询数组中的成员
+            sql = "SELECT * FROM media_metadata WHERE item_type = %s AND tmdb_id = ANY(%s)"
+            cursor.execute(sql, (item_type, tmdb_ids))
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+    except psycopg2.Error as e:
+        logger.error(f"根据TMDb ID列表批量获取媒体元数据时出错: {e}", exc_info=True)
+        return []
+# ★★★ 新增函数：为规则筛选类合集在数据库中追加一个媒体项 ★★★
+def append_item_to_filter_collection_db(collection_id: int, new_item_tmdb_id: str, new_item_emby_id: str) -> bool:
+    """
+    当一个新媒体项匹配规则筛选合集时，更新数据库中的状态。
+    这包括向 generated_media_info_json 追加精简信息，并更新 in_library_count。
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            # 开启事务并锁定行，防止并发写入冲突
+            cursor.execute("BEGIN TRANSACTION;")
+            cursor.execute("SELECT generated_media_info_json, in_library_count FROM custom_collections WHERE id = %s FOR UPDATE", (collection_id,))
+            row = cursor.fetchone()
+            if not row:
+                conn.rollback()
+                logger.warning(f"尝试向规则合集 (DB ID: {collection_id}) 追加媒体项，但未找到该合集。")
+                return False
+
+            # 获取当前JSON，如果为NULL或无效，则初始化为空列表
+            media_list = row.get('generated_media_info_json') or []
+            if not isinstance(media_list, list):
+                media_list = []
+            
+            # 检查是否已存在，避免重复添加
+            if any(item.get('emby_id') == new_item_emby_id for item in media_list):
+                conn.rollback()
+                logger.debug(f"媒体项 {new_item_emby_id} 已存在于合集 {collection_id} 的JSON缓存中，跳过追加。")
+                return True
+
+            # 追加新的精简媒体信息
+            media_list.append({
+                'tmdb_id': new_item_tmdb_id,
+                'emby_id': new_item_emby_id
+            })
+            
+            # 更新库内数量
+            new_in_library_count = (row.get('in_library_count') or 0) + 1
+            
+            # 将更新后的数据写回数据库
+            new_json_data = json.dumps(media_list, ensure_ascii=False)
+            cursor.execute(
+                "UPDATE custom_collections SET generated_media_info_json = %s, in_library_count = %s WHERE id = %s",
+                (new_json_data, new_in_library_count, collection_id)
+            )
+            conn.commit()
+            logger.info(f"  -> 数据库状态同步：已将新媒体项 {new_item_emby_id} 追加到规则合集 (DB ID: {collection_id}) 的JSON缓存中。")
+            return True
+
+    except Exception as e:
+        if 'conn' in locals() and conn:
+            conn.rollback()
+        logger.error(f"向规则合集 {collection_id} 的JSON缓存追加媒体项时发生数据库错误: {e}", exc_info=True)
+        return False
+# ======================================================================
+# 模块 7: 应用设置数据访问 (Application Settings Data Access)
+# ======================================================================
+
+def get_setting(setting_key: str) -> Optional[Any]:
+    """
+    从 app_settings 表中获取一个设置项的值。
+    :param setting_key: 设置项的键。
+    :return: 设置项的值 (通常是字典)，如果未找到则返回 None。
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT value_json FROM app_settings WHERE setting_key = %s", (setting_key,))
+            row = cursor.fetchone()
+            # psycopg2 会自动将 JSONB 字段解析为 Python 对象
+            return row['value_json'] if row else None
+    except Exception as e:
+        logger.error(f"DB: 获取设置 '{setting_key}' 时失败: {e}", exc_info=True)
+        raise
+
+def _save_setting_with_cursor(cursor, setting_key: str, value: Dict[str, Any]):
+    """
+    【内部函数】使用一个已有的数据库游标来保存设置。
+    这个函数不开启或提交事务，由调用方负责。
+    """
+    sql = """
+        INSERT INTO app_settings (setting_key, value_json, last_updated_at)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT (setting_key) DO UPDATE SET
+            value_json = EXCLUDED.value_json,
+            last_updated_at = NOW();
+    """
+    value_as_json = json.dumps(value, ensure_ascii=False)
+    cursor.execute(sql, (setting_key, value_as_json))
+
+def save_setting(setting_key: str, value: Dict[str, Any]):
+    """
+    【V2 - 重构版】向 app_settings 表中保存或更新一个设置项。
+    现在它调用内部函数来完成工作。
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            # ★★★ 核心修改：调用新的内部函数 ★★★
+            _save_setting_with_cursor(cursor, setting_key, value)
+            conn.commit()
+            logger.info(f"DB: 成功保存设置 '{setting_key}'。")
+    except Exception as e:
+        logger.error(f"DB: 保存设置 '{setting_key}' 时失败: {e}", exc_info=True)
+        raise
+# ======================================================================
+# 模块 8: 媒体洗版设置数据访问 (Resubscribe Settings Data Access) - ★★★ 新增模块 ★★★
+# ======================================================================
+# --- 规则管理 (Rules Management) ---
+
+def _prepare_rule_data_for_db(rule_data: Dict[str, Any]) -> Dict[str, Any]:
+    """【内部函数】准备规则数据以便存入数据库，自动包装JSONB字段。"""
+    data_to_save = rule_data.copy()
+    jsonb_fields = [
+        'target_library_ids', 'resubscribe_audio_missing_languages',
+        'resubscribe_subtitle_missing_languages', 'resubscribe_quality_include',
+        'resubscribe_effect_include'
+    ]
+    for field in jsonb_fields:
+        if field in data_to_save and data_to_save[field] is not None:
+            data_to_save[field] = Json(data_to_save[field])
+    return data_to_save
+
+def get_all_resubscribe_rules() -> List[Dict[str, Any]]:
+    """获取所有洗版规则，按优先级排序。"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM resubscribe_rules ORDER BY sort_order ASC, id ASC")
+            return [dict(row) for row in cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"DB: 获取所有洗版规则时失败: {e}", exc_info=True)
+        return []
+
+def create_resubscribe_rule(rule_data: Dict[str, Any]) -> int:
+    """创建一条新的洗版规则，并返回其ID。"""
+    try:
+        prepared_data = _prepare_rule_data_for_db(rule_data)
+        columns = prepared_data.keys()
+        placeholders = ', '.join(['%s'] * len(columns))
+        sql = f"INSERT INTO resubscribe_rules ({', '.join(columns)}) VALUES ({placeholders}) RETURNING id"
+        
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, list(prepared_data.values()))
+            result = cursor.fetchone()
+            if not result:
+                raise psycopg2.Error("数据库未能返回新创建的规则ID。")
+            new_id = result['id']
+            conn.commit()
+            logger.info(f"DB: 成功创建洗版规则 '{rule_data.get('name')}' (ID: {new_id})。")
+            return new_id
+    except psycopg2.IntegrityError as e:
+        logger.warning(f"DB: 创建洗版规则失败，可能名称 '{rule_data.get('name')}' 已存在: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"DB: 创建洗版规则时发生未知错误: {e}", exc_info=True)
+        raise
+
+def update_resubscribe_rule(rule_id: int, rule_data: Dict[str, Any]) -> bool:
+    """更新指定ID的洗版规则。"""
+    try:
+        prepared_data = _prepare_rule_data_for_db(rule_data)
+        set_clauses = [f"{key} = %s" for key in prepared_data.keys()]
+        sql = f"UPDATE resubscribe_rules SET {', '.join(set_clauses)} WHERE id = %s"
+        values = list(prepared_data.values())
+        values.append(rule_id)
+        
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, tuple(values))
+            if cursor.rowcount == 0:
+                logger.warning(f"DB: 尝试更新洗版规则ID {rule_id}，但在数据库中未找到。")
+                return False
+            conn.commit()
+            logger.info(f"DB: 成功更新洗版规则ID {rule_id}。")
+            return True
+    except Exception as e:
+        logger.error(f"DB: 更新洗版规则ID {rule_id} 时失败: {e}", exc_info=True)
+        raise
+
+def delete_resubscribe_rule(rule_id: int) -> bool:
+    """删除指定ID的洗版规则。"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM resubscribe_rules WHERE id = %s", (rule_id,))
+            if cursor.rowcount == 0:
+                logger.warning(f"DB: 尝试删除洗版规则ID {rule_id}，但在数据库中未找到。")
+                return False
+            conn.commit()
+            logger.info(f"DB: 成功删除洗版规则ID {rule_id}。")
+            return True
+    except Exception as e:
+        logger.error(f"DB: 删除洗版规则ID {rule_id} 时失败: {e}", exc_info=True)
+        raise
+
+def update_resubscribe_rules_order(ordered_ids: List[int]) -> bool:
+    """根据ID列表批量更新洗版规则的排序。"""
+    if not ordered_ids:
+        return True
+    data_to_update = [(index, rule_id) for index, rule_id in enumerate(ordered_ids)]
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            from psycopg2.extras import execute_values
+            sql = "UPDATE resubscribe_rules SET sort_order = data.sort_order FROM (VALUES %s) AS data(sort_order, id) WHERE resubscribe_rules.id = data.id;"
+            execute_values(cursor, sql, data_to_update)
+            conn.commit()
+            logger.info(f"DB: 成功更新了 {len(ordered_ids)} 个洗版规则的顺序。")
+            return True
+    except Exception as e:
+        logger.error(f"DB: 批量更新洗版规则顺序时失败: {e}", exc_info=True)
+        raise
+
+# --- 缓存管理 (Cache Management) ---
+
+def get_all_resubscribe_cache() -> List[Dict[str, Any]]:
+    """获取所有洗版缓存数据。"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM resubscribe_cache ORDER BY item_name")
+            return [dict(row) for row in cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"DB: 获取洗版缓存失败: {e}", exc_info=True)
+        return []
+
+def upsert_resubscribe_cache_batch(items_data: List[Dict[str, Any]]):
+    """【V5 - 增加来源库ID】批量更新或插入洗版缓存数据。"""
+    if not items_data:
+        return
+
+    sql = """
+        INSERT INTO resubscribe_cache (
+            item_id, item_name, tmdb_id, item_type, status, reason,
+            resolution_display, quality_display, effect_display, audio_display, subtitle_display,
+            audio_languages_raw, subtitle_languages_raw, last_checked_at,
+            matched_rule_id, matched_rule_name, source_library_id
+        ) VALUES %s
+        ON CONFLICT (item_id) DO UPDATE SET
+            item_name = EXCLUDED.item_name, tmdb_id = EXCLUDED.tmdb_id,
+            item_type = EXCLUDED.item_type, status = EXCLUDED.status,
+            reason = EXCLUDED.reason, resolution_display = EXCLUDED.resolution_display,
+            quality_display = EXCLUDED.quality_display, effect_display = EXCLUDED.effect_display,
+            audio_display = EXCLUDED.audio_display, subtitle_display = EXCLUDED.subtitle_display,
+            audio_languages_raw = EXCLUDED.audio_languages_raw,
+            subtitle_languages_raw = EXCLUDED.subtitle_languages_raw,
+            last_checked_at = EXCLUDED.last_checked_at,
+            matched_rule_id = EXCLUDED.matched_rule_id,
+            matched_rule_name = EXCLUDED.matched_rule_name,
+            source_library_id = EXCLUDED.source_library_id;
+    """
+    values_to_insert = []
+    for item in items_data:
+        values_to_insert.append((
+            item.get('item_id'), item.get('item_name'), item.get('tmdb_id'),
+            item.get('item_type'), item.get('status'), item.get('reason'),
+            item.get('resolution_display'), item.get('quality_display'), item.get('effect_display'),
+            item.get('audio_display'), item.get('subtitle_display'),
+            json.dumps(item.get('audio_languages_raw', [])),
+            json.dumps(item.get('subtitle_languages_raw', [])),
+            datetime.now(timezone.utc),
+            item.get('matched_rule_id'),
+            item.get('matched_rule_name'),
+            item.get('source_library_id')
+        ))
+    
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            from psycopg2.extras import execute_values
+            execute_values(cursor, sql, values_to_insert, page_size=500)
+            conn.commit()
+    except Exception as e:
+        logger.error(f"DB: 批量更新洗版缓存失败: {e}", exc_info=True)
+        raise
+
+def update_resubscribe_item_status(item_id: str, new_status: str) -> bool:
+    """更新单个洗版缓存条目的状态。"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE resubscribe_cache SET status = %s WHERE item_id = %s",
+                (new_status, item_id)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logger.error(f"DB: 更新洗版缓存状态失败 for item {item_id}: {e}", exc_info=True)
+        return False
+
+def delete_resubscribe_cache_by_rule_id(rule_id: int) -> int:
+    """根据规则ID，删除所有关联的洗版缓存项。"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM resubscribe_cache WHERE matched_rule_id = %s", (rule_id,))
+            deleted_count = cursor.rowcount
+            conn.commit()
+            logger.info(f"DB: 联动删除了 {deleted_count} 条与规则ID {rule_id} 关联的洗版缓存。")
+            return deleted_count
+    except Exception as e:
+        logger.error(f"DB: 根据规则ID {rule_id} 删除洗版缓存时失败: {e}", exc_info=True)
+        raise
+
+def delete_resubscribe_cache_for_unwatched_libraries(watched_library_ids: List[str]) -> int:
+    """删除所有来自“未被任何规则监控的”媒体库的缓存项。"""
+    if not watched_library_ids:
+        sql = "DELETE FROM resubscribe_cache"
+        params = []
+    else:
+        # 使用元组作为IN子句的参数
+        sql = "DELETE FROM resubscribe_cache WHERE source_library_id IS NOT NULL AND source_library_id NOT IN %s"
+        params = [tuple(watched_library_ids)]
+    
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
+            deleted_count = cursor.rowcount
+            conn.commit()
+            if deleted_count > 0:
+                logger.info(f"DB: [自愈清理] 成功删除了 {deleted_count} 条来自无效媒体库的陈旧洗版缓存。")
+            return deleted_count
+    except Exception as e:
+        logger.error(f"DB: [自愈清理] 清理无效洗版缓存时失败: {e}", exc_info=True)
+        raise
+
+def get_resubscribe_cache_item(item_id: str) -> Optional[Dict[str, Any]]:
+    """根据 item_id 获取单个洗版缓存项。"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM resubscribe_cache WHERE item_id = %s", (item_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    except Exception as e:
+        logger.error(f"DB: 获取单个洗版缓存项 {item_id} 失败: {e}", exc_info=True)
+        return None
+
+def get_resubscribe_rule_by_id(rule_id: int) -> Optional[Dict[str, Any]]:
+    """根据 rule_id 获取单个洗版规则。"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM resubscribe_rules WHERE id = %s", (rule_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    except Exception as e:
+        logger.error(f"DB: 获取单个洗版规则 {rule_id} 失败: {e}", exc_info=True)
+        return None
+    
+def delete_resubscribe_cache_item(item_id: str) -> bool:
+    """根据 item_id 从洗版缓存中删除单条记录。"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM resubscribe_cache WHERE item_id = %s", (item_id,))
+            conn.commit()
+            # 确认是否真的删掉了一行
+            return cursor.rowcount > 0
+    except Exception as e:
+        logger.error(f"DB: 删除单条洗版缓存项 {item_id} 失败: {e}", exc_info=True)
+        return False
+    
+def get_resubscribe_cache_item_ids_by_library(library_ids: List[str]) -> set:
+    """根据媒体库ID列表，获取所有相关的洗版缓存项目ID。"""
+    if not library_ids:
+        return set()
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            # 使用 ANY(%s) 语法可以高效地查询数组中的成员
+            sql = "SELECT item_id FROM resubscribe_cache WHERE source_library_id = ANY(%s)"
+            cursor.execute(sql, (library_ids,))
+            return {row['item_id'] for row in cursor.fetchall()}
+    except Exception as e:
+        logger.error(f"DB: 根据媒体库ID获取洗版缓存ID时失败: {e}", exc_info=True)
+        return set()
+
+def delete_resubscribe_cache_by_item_ids(item_ids: List[str]) -> int:
+    """根据 item_id 列表，批量删除洗版缓存记录。"""
+    if not item_ids:
+        return 0
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            sql = "DELETE FROM resubscribe_cache WHERE item_id = ANY(%s)"
+            cursor.execute(sql, (item_ids,))
+            deleted_count = cursor.rowcount
+            conn.commit()
+            return deleted_count
+    except Exception as e:
+        logger.error(f"DB: 批量删除洗版缓存项时失败: {e}", exc_info=True)
+        return 0
+    
+# ======================================================================
+# 模块 9: 全局订阅配额管理器 (Subscription Quota Manager) -          ★★★
+# ======================================================================
+
+def get_subscription_quota() -> int:
+    """
+    【核心】获取当前可用的订阅配额。
+    - 实现了“懒重置”：在每天第一次被调用时，会自动将配额重置为配置中的最大值。
+    """
+    try:
+        # 从主配置中读取最大配额，这是重置的基准
+        max_quota = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_RESUBSCRIBE_DAILY_CAP, 200)
+        
+        # 获取今天的日期字符串，用于比较
+        today_str = datetime.now(pytz.timezone(constants.TIMEZONE)).strftime('%Y-%m-%d')
+
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            # 从 app_settings 表中获取配额状态
+            state = get_setting('subscription_quota_state') or {}
+            
+            last_reset_date = state.get('last_reset_date')
+            
+            # --- 核心逻辑：判断是否需要重置 ---
+            if last_reset_date != today_str:
+                # 如果是新的一天，或者从未设置过
+                logger.info(f"检测到新的一天 ({today_str})，正在重置订阅配额为 {max_quota}。")
+                new_state = {
+                    'current_quota': max_quota,
+                    'last_reset_date': today_str
+                }
+                # 将新的状态存回数据库
+                save_setting('subscription_quota_state', new_state)
+                # 返回全新的、满满的配额
+                return max_quota
+            else:
+                # 如果今天已经重置过，直接返回当前剩余的配额
+                current_quota = state.get('current_quota', 0)
+                logger.debug(f"  -> 当前剩余订阅配额: {current_quota}")
+                return current_quota
+
+    except Exception as e:
+        logger.error(f"获取订阅配额时发生严重错误，将返回0以确保安全: {e}", exc_info=True)
+        return 0
+
+def decrement_subscription_quota() -> bool:
+    """
+    将当前订阅配额减一。
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN;")
+            try:
+                cursor.execute("SELECT value_json FROM app_settings WHERE setting_key = 'subscription_quota_state' FOR UPDATE")
+                row = cursor.fetchone()
+                
+                if not row or not row.get('value_json'):
+                    conn.rollback()
+                    logger.warning("尝试减少配额，但未找到配额状态记录。")
+                    return False
+
+                state = row['value_json']
+                current_quota = state.get('current_quota', 0)
+
+                if current_quota > 0:
+                    state['current_quota'] = current_quota - 1
+                    # ★★★ 核心修改：直接调用内部函数，在同一个事务中完成所有操作 ★★★
+                    _save_setting_with_cursor(cursor, 'subscription_quota_state', state)
+                    logger.debug(f"  -> 配额已消耗，剩余: {state['current_quota']}")
+                
+                conn.commit()
+                return True
+            except Exception as e_trans:
+                conn.rollback()
+                logger.error(f"减少配额的数据库事务失败: {e_trans}", exc_info=True)
+                return False
+    except Exception as e:
+        logger.error(f"减少订阅配额时发生严重错误: {e}", exc_info=True)
+        return False

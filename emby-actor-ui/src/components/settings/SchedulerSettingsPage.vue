@@ -214,7 +214,12 @@ const runTaskFromModal = async (isDeepMode) => {
     // ★★★ 核心修改：为所有需要模式选择的任务动态添加参数 ★★★
     if (taskIdentifier === 'full-scan') {
       payload.force_reprocess = isDeepMode;
-    } else if (taskIdentifier === 'populate-metadata' || taskIdentifier === 'sync-images-map') {
+    } 
+    else if (
+      taskIdentifier === 'populate-metadata' || 
+      taskIdentifier === 'sync-images-map' ||
+      taskIdentifier === 'enrich-aliases' 
+    ) {
       payload.force_full_update = isDeepMode;
     }
 
@@ -236,7 +241,7 @@ const triggerTaskNow = async (taskIdentifier) => {
   }
 
   // 如果是“全量处理和同步媒体数据”，则显示模态框，而不是直接执行
-  if (['full-scan', 'populate-metadata', 'sync-images-map'].includes(taskIdentifier)) {
+  if (['full-scan', 'populate-metadata', 'sync-images-map', 'enrich-aliases'].includes(taskIdentifier)) {
     taskToRunInModal.value = taskIdentifier; 
     showSyncModeModal.value = true;
     return; 

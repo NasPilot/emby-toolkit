@@ -15,7 +15,7 @@
     </n-form-item>
     <n-form-item label="包含的题材">
       <n-select
-        v-model:value="localConfig.genres_include"
+        v-model:value="localConfig.genres_include_json"
         multiple
         placeholder="留空则包含所有题材"
         :options="genreOptions"
@@ -23,7 +23,7 @@
     </n-form-item>
     <n-form-item label="排除的题材">
       <n-select
-        v-model:value="localConfig.genres_exclude"
+        v-model:value="localConfig.genres_exclude_json"
         multiple
         placeholder="选择要排除的题材"
         :options="genreOptions"

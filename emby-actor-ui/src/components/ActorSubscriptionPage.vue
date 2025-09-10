@@ -8,6 +8,12 @@
         </template>
         <template #extra>
           <n-space>
+            <n-button @click="handleManageDefaultConfig">
+              <template #icon>
+                <n-icon><settings-icon /></n-icon>
+              </template>
+              默认订阅配置
+            </n-button>
             <n-button @click="handleRefreshSubscriptions">
               <template #icon>
                 <n-icon><sync-icon /></n-icon>
@@ -78,6 +84,10 @@
         @subscription-updated="onSubscriptionChange" 
         @subscription-deleted="onSubscriptionChange"
       />
+      <default-config-modal
+        :show="showDefaultConfigModal"
+        @update:show="showDefaultConfigModal = $event"
+      />
     </div>
   </n-layout>
 </template>
@@ -86,10 +96,11 @@
 // ✨ [核心修改] 引入 onBeforeUnmount 和 watch
 import { ref, onMounted, onBeforeUnmount, watch, computed } from 'vue';
 import { NPageHeader, NButton, NIcon, NText, NGrid, NGi, NCard, NSpin, NEmpty, NTag, useMessage, NSpace } from 'naive-ui';
-import { Add as AddIcon, SyncOutline as SyncIcon } from '@vicons/ionicons5';
+import { Add as AddIcon, SyncOutline as SyncIcon, SettingsOutline as SettingsIcon } from '@vicons/ionicons5';
 import axios from 'axios';
 import AddSubscriptionModal from './modals/AddSubscriptionModal.vue';
 import SubscriptionDetailsModal from './modals/SubscriptionDetailsModal.vue';
+import DefaultConfigModal from './modals/DefaultConfigModal.vue';
 
 const loading = ref(true);
 const subscriptions = ref([]);
@@ -97,6 +108,7 @@ const showAddModal = ref(false);
 const message = useMessage();
 const showDetailsModal = ref(false); 
 const selectedSubId = ref(null); 
+const showDefaultConfigModal = ref(false);
 
 // ✨ [核心修改] 无限滚动相关状态
 const displayCount = ref(40); // 演员卡片小，可以多显示一些
@@ -153,6 +165,10 @@ const getImageUrl = (path) => {
 
 const handleAddSubscription = () => {
   showAddModal.value = true;
+};
+
+const handleManageDefaultConfig = () => {
+  showDefaultConfigModal.value = true;
 };
 
 const handleCardClick = (subscription) => {

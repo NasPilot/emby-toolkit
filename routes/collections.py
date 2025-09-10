@@ -34,40 +34,47 @@ def api_subscribe_moviepilot():
     data = request.json
     tmdb_id = data.get('tmdb_id')
     title = data.get('title')
-
     if not tmdb_id or not title:
         return jsonify({"error": "请求中缺少 tmdb_id 或 title"}), 400
+
+    # ★★★ 配额检查 ★★★
+    current_quota = db_handler.get_subscription_quota()
+    if current_quota <= 0:
+        logger.warning(f"API: 用户尝试订阅《{title}》，但每日配额已用尽。")
+        return jsonify({"error": "今日订阅配额已用尽，请明天再试。"}), 429
 
     # 1. 准备传递给业务逻辑函数的数据
     movie_info = {
         'tmdb_id': tmdb_id,
         'title': title
     }
-
-    # 2. 直接调用业务逻辑函数，并将全局配置传递进去
-    #    所有复杂的登录、请求、错误处理都已封装在函数内部
+    # 2. 调用业务逻辑函数
     success = moviepilot_handler.subscribe_movie_to_moviepilot(movie_info, config_manager.APP_CONFIG)
-
-    # 3. 根据返回的布尔值，生成对应的API响应
     if success:
+        # 配额消耗
+        db_handler.decrement_subscription_quota()
         return jsonify({"message": f"《{title}》已成功提交到 MoviePilot 订阅！"}), 200
     else:
-        # 具体的错误原因已经被 moviepilot_handler 记录到日志中
-        # API层面只需返回一个通用的失败信息
         return jsonify({"error": "订阅失败，请检查后端日志获取详细信息。"}), 500
 
 @collections_bp.route('/subscribe_all_missing', methods=['POST'])
 @login_required
 def api_subscribe_all_missing():
     logger.info("API (Blueprint): 收到一键订阅所有缺失电影的请求。")
+
     total_subscribed_count = 0
     total_failed_count = 0
     
     try:
         collections_to_process = db_handler.get_collections_with_missing_movies()
-
         if not collections_to_process:
             return jsonify({"message": "没有发现任何缺失的电影需要订阅。", "count": 0}), 200
+        
+        # 获取剩余配额
+        current_quota = db_handler.get_subscription_quota()
+        if current_quota <= 0:
+            logger.warning("API: 用户尝试执行一键订阅，但每日配额已用尽。")
+            return jsonify({"error": "今日订阅配额已用尽，请明天再试。"}), 429
 
         for collection in collections_to_process:
             collection_id = collection['emby_collection_id']
@@ -79,23 +86,38 @@ def api_subscribe_all_missing():
                 continue
 
             needs_db_update = False
+            
             for movie in movies:
                 if movie.get('status') == 'missing':
+                    # 先检查配额是否足够
+                    if current_quota <= 0:
+                        logger.warning("API: 配额用尽，停止剩余电影订阅。")
+                        break  # 退出循环，停止继续订阅
+
                     success = moviepilot_handler.subscribe_movie_to_moviepilot(movie, config_manager.APP_CONFIG)
                     if success:
                         movie['status'] = 'subscribed'
                         total_subscribed_count += 1
                         needs_db_update = True
+                        current_quota -= 1
+                        db_handler.decrement_subscription_quota()  # 确保数据库配额同步更新
                     else:
                         total_failed_count += 1
-            
+
             if needs_db_update:
                 db_handler.update_collection_movies(collection_id, movies)
+
+            if current_quota <= 0:
+                # 退出处理所有collection的循环
+                logger.info("API: 配额用尽，停止处理更多合集的订阅。")
+                break
         
         message = f"操作完成！成功提交 {total_subscribed_count} 部电影订阅。"
         if total_failed_count > 0:
             message += f" 有 {total_failed_count} 部电影订阅失败，请检查日志。"
-        
+        if current_quota <= 0:
+            message += " 今日订阅配额已用尽，部分订阅可能未完成。"
+
         return jsonify({"message": message, "count": total_subscribed_count}), 200
 
     except Exception as e:

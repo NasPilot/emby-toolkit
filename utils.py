@@ -79,28 +79,6 @@ def clean_character_name_static(character_name: Optional[str]) -> str:
 
     # 如果只有外文，或清理后是英文，保留原值，等待后续翻译流程
     return name.strip()
-def translate_text_with_translators(
-    query_text: str,
-    to_language: str = 'zh',
-    engine_order: Optional[List[str]] = None,
-    from_language: str = 'auto'
-) -> Optional[Dict[str, str]]:
-    """使用指定的翻译引擎顺序尝试翻译文本。"""
-    if not query_text or not query_text.strip() or not TRANSLATORS_LIB_AVAILABLE:
-        return None
-    if engine_order is None:
-        engine_order = ['bing', 'google', 'baidu']
-    for engine_name in engine_order:
-        try:
-            translated_text = translators_translate_text(
-                query_text, translator=engine_name, to_language=to_language,
-                from_language=from_language, timeout=10.0
-            )
-            if translated_text and translated_text.strip().lower() != query_text.strip().lower():
-                return {"text": translated_text.strip(), "engine": engine_name}
-        except Exception:
-            continue
-    return None
 
 def generate_search_url(site: str, title: str, year: Optional[int] = None) -> str:
     """为指定网站生成搜索链接。"""
@@ -223,9 +201,7 @@ class LogDBManager:
         except Exception as e:
             logger.error(f"更新资源同步时间戳时失败 for item {item_id}: {e}", exc_info=True)
 
-# --- ★★★ 新增：统一分级映射功能 (V2 - 健壮版) ★★★ ---
-# (此代码块替换掉原来的整个分级映射部分)
-
+# --- ★★★ 统一分级映射功能 (V2 - 健壮版) ★★★ ---
 # 1. 定义我们自己的、统一的、友好的分级体系
 UNIFIED_RATING_CATEGORIES = [
     '全年龄', '家长辅导', '青少年', '成人', '限制级', '未知'
@@ -246,7 +222,7 @@ RATING_MAP = {
     '10': '家长辅导',
 
     # --- 青少年 ---
-    'pg-13': '青少年', 't': '青少年',
+    'pg-13': '青少年', 'SG-PG13': '青少年', 't': '青少年',
     '12': '青少年', '13': '青少年', '14': '青少年', 'tv-14': '青少年',
     '15': '青少年', '16': '青少年',
 
@@ -401,11 +377,6 @@ def translate_country_list(country_names_or_codes: list) -> list:
     if not country_names_or_codes:
         return []
     
-    # ▼▼▼ 核心修复：确保函数调用是明确的 ▼▼▼
-    # 理论上直接调用 get_country_translation_map() 就可以，
-    # 但为了确保 Pylance 能理解，我们可以保持现状，因为它逻辑上是正确的。
-    # 这个错误很可能是 Pylance 的一个误报，因为函数定义就在同一个文件里。
-    # 我们可以先忽略这个 utils.py 的错误，因为它在运行时应该不会有问题。
     translation_map = get_country_translation_map()
     
     if not translation_map:
@@ -417,19 +388,3 @@ def translate_country_list(country_names_or_codes: list) -> list:
         translated_list.append(translated)
         
     return list(dict.fromkeys(translated_list))
-
-
-
-# if __name__ == '__main__':
-#     # 测试新的 are_names_match
-#     print("\n--- Testing are_names_match ---")
-#     # 测试1: 张子枫
-#     print(f"张子枫 vs Zhang Zifeng: {are_names_match('Zhang Zifeng', 'Zhang Zifeng', '张子枫', 'Zifeng Zhang')}") # 应该为 True
-#     # 测试2: 姓/名顺序
-#     print(f"Jon Hamm vs Hamm Jon: {are_names_match('Jon Hamm', None, 'Hamm Jon', None)}") # 应该为 True
-#     # 测试3: 特殊字符和大小写
-#     print(f"Chloë Moretz vs chloe moretz: {are_names_match('Chloë Moretz', None, 'chloe moretz', None)}") # 应该为 True
-#     # 测试4: 中文 vs 拼音
-#     print(f"张三 vs zhang san: {are_names_match('zhang san', None, '张三', None)}") # 应该为 True
-#     # 测试5: 不匹配
-#     print(f"Zhang San vs Li Si: {are_names_match('Zhang San', None, 'Li Si', None)}") # 应该为 False

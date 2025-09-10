@@ -2,10 +2,10 @@
 
 from flask import Blueprint, request, jsonify
 import logging
-import psycopg2 # 导入 psycopg2 以捕获其特定的异常
+import psycopg2 
 
 # 导入需要的模块
-import db_handler # 使用新的 PostgreSQL db_handler
+import db_handler 
 import config_manager
 import tmdb_handler
 import task_manager
@@ -49,12 +49,47 @@ def api_search_actors():
         logger.error(f"API /api/actor-subscriptions/search 发生错误: {e}", exc_info=True)
         return jsonify({"error": "搜索演员时发生未知的服务器错误"}), 500
 
+# ✨ 定义默认订阅配置的路由
+@actor_subscriptions_bp.route('/default-config', methods=['GET', 'POST'])
+@login_required
+def handle_default_actor_config():
+    """
+    处理获取和保存演员订阅的默认配置。
+    此函数直接与数据库交互，使用带 _json 后缀的标准键名。
+    """
+    if request.method == 'GET':
+        try:
+            # 直接从数据库获取标准格式的配置
+            default_config = db_handler.get_setting('actor_subscriptions_default_config') or {}
+            
+            # ★★★ 最终方案：直接返回标准格式，确保所有必需的键存在 ★★★
+            final_config = {
+                "start_year": default_config.get("start_year"),
+                "media_types": default_config.get("media_types", []),
+                "genres_include_json": default_config.get("genres_include_json", []),
+                "genres_exclude_json": default_config.get("genres_exclude_json", []),
+                "min_rating": default_config.get("min_rating", 0.0)
+            }
+            return jsonify(final_config)
+        except Exception as e:
+            logger.error(f"获取默认演员订阅配置失败: {e}", exc_info=True)
+            return jsonify({"error": "获取默认配置时发生服务器内部错误"}), 500
+
+    if request.method == 'POST':
+        try:
+            # ★★★ 最终方案：假设前端发送的就是带 _json 后缀的标准格式，直接保存 ★★★
+            new_config = request.json
+            db_handler.save_setting('actor_subscriptions_default_config', new_config)
+            return jsonify({"message": "默认配置已成功保存！"})
+        except Exception as e:
+            logger.error(f"保存默认演员订阅配置失败: {e}", exc_info=True)
+            return jsonify({"error": "保存默认配置时发生服务器内部错误"}), 500
+
 @actor_subscriptions_bp.route('', methods=['GET', 'POST'])
 @login_required
 def handle_actor_subscriptions():
     if request.method == 'GET':
         try:
-            # ★★★ 核心修改：调用新的 db_handler 函数，不再需要 db_path 参数
             subscriptions = db_handler.get_all_actor_subscriptions()
             return jsonify(subscriptions)
         except Exception as e:
@@ -63,25 +98,33 @@ def handle_actor_subscriptions():
 
     if request.method == 'POST':
         data = request.json
-        # --- ▼▼▼ 核心修复：在这里添加输入验证 ▼▼▼ ---
         tmdb_person_id = data.get('tmdb_person_id')
         actor_name = data.get('actor_name')
 
         if not tmdb_person_id or not actor_name:
             return jsonify({"error": "请求无效: 缺少 tmdb_person_id 或 actor_name"}), 400
-        # --- ▲▲▲ 修复结束 ▲▲▲ ---
+        
+        # ✨ [核心修改] 应用默认订阅配置
+        subscription_config = data.get('config')
+        
+        # 如果前端没有提供配置 (None 或空字典)，则从系统中加载默认配置
+        if not subscription_config:
+            logger.info(f"为新演员 '{actor_name}' 应用默认订阅配置。")
+            # ★★★ 从数据库获取默认配置 ★★★
+            subscription_config = db_handler.get_setting('actor_subscriptions_default_config') or {}
+        else:
+            logger.info(f"为新演员 '{actor_name}' 使用了自定义的订阅配置。")
+
         try:
-            # ★★★ 核心修改：使用我们已经验证过的变量 ★★★
             new_sub_id = db_handler.add_actor_subscription(
                 tmdb_person_id=tmdb_person_id,
                 actor_name=actor_name,
                 profile_path=data.get('profile_path'),
-                config=data.get('config', {})
+                config=subscription_config # ★ 使用最终确定的配置
             )
             return jsonify({"message": f"演员 {actor_name} 已成功订阅！", "id": new_sub_id}), 201
         
         except psycopg2.IntegrityError:
-            # 现在，如果还触发这个错误，那它就真的是因为重复订阅了
             return jsonify({"error": "该演员已经被订阅过了"}), 409
         except Exception as e:
             logger.error(f"添加演员订阅失败: {e}", exc_info=True)

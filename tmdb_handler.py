@@ -334,9 +334,9 @@ def get_collection_details_tmdb(collection_id: int, api_key: str) -> Optional[Di
     logger.debug(f"TMDb: 获取合集详情 (ID: {collection_id})")
     return _tmdb_request(endpoint, api_key, params)
 # --- 搜索媒体 ---
-def search_media(query: str, api_key: str, item_type: str = 'movie') -> Optional[List[Dict[str, Any]]]:
+def search_media(query: str, api_key: str, item_type: str = 'movie', year: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
     """
-    【V2 - 通用版】通过名字在 TMDb 上搜索媒体（电影、电视剧、演员）。
+    【V3 - 年份感知版】通过名字在 TMDb 上搜索媒体（电影、电视剧、演员），支持年份筛选。
     """
     if not query or not api_key:
         return None
@@ -360,12 +360,21 @@ def search_media(query: str, api_key: str, item_type: str = 'movie') -> Optional
         "language": DEFAULT_LANGUAGE
     }
     
-    logger.debug(f"TMDb: 正在搜索 {item_type}: '{query}'")
+    # 新增：如果提供了年份，则添加到请求参数中
+    if year:
+        item_type_lower = item_type.lower()
+        if item_type_lower == 'movie':
+            params['year'] = year
+        elif item_type_lower in ['tv', 'series']:
+            params['first_air_date_year'] = year
+
+    year_info = f" (年份: {year})" if year else ""
+    logger.debug(f"TMDb: 正在搜索 {item_type}: '{query}'{year_info}")
     data = _tmdb_request(endpoint, api_key, params)
     
     # 如果中文搜索不到，可以尝试用英文再搜一次
     if data and not data.get("results") and params['language'].startswith("zh"):
-        logger.debug(f"中文搜索 '{query}' 未找到结果，尝试使用英文再次搜索...")
+        logger.debug(f"中文搜索 '{query}'{year_info} 未找到结果，尝试使用英文再次搜索...")
         params['language'] = 'en-US'
         data = _tmdb_request(endpoint, api_key, params)
 

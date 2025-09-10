@@ -7,11 +7,16 @@ import shutil
 import time
 import utils
 import threading
+# ★★★ 核心修改 1/3: 导入我们需要的配置管理器和常量 ★★★
 import config_manager
+import constants
 from typing import Optional, List, Dict, Any, Generator, Tuple, Set
 import logging
 logger = logging.getLogger(__name__)
 # (SimpleLogger 和 logger 的导入保持不变)
+
+# ★★★ 核心修改 2/3: 删除之前硬编码的超时常量 (如果存在) ★★★
+# EMBY_API_TIMEOUT = 60  <-- 删除这一行
 
 class SimpleLogger:
     def info(self, msg): print(f"[EMBY_INFO] {msg}")
@@ -22,6 +27,37 @@ class SimpleLogger:
 _emby_id_cache = {}
 _emby_season_cache = {}
 _emby_episode_cache = {}
+# ★★★ 模拟用户登录以获取临时 AccessToken 的辅助函数 ★★★
+def _get_emby_access_token(emby_url, username, password) -> tuple[Optional[str], Optional[str]]:
+    """通过用户名和密码登录，获取临时的 AccessToken 和 UserId。"""
+    auth_url = f"{emby_url.rstrip('/')}/Users/AuthenticateByName"
+    
+    # Emby 登录需要特定的请求头来表明自己是哪个应用
+    headers = {
+        'Content-Type': 'application/json',
+        'X-Emby-Authorization': 'Emby Client="Emby Toolkit", Device="Toolkit", DeviceId="d4f3e4b4-9f5b-4b8f-8b8a-5c5c5c5c5c5c", Version="1.0.0"'
+    }
+    
+    payload = {
+        "Username": username,
+        "Pw": password
+    }
+    
+    try:
+        response = requests.post(auth_url, headers=headers, json=payload, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        access_token = data.get("AccessToken")
+        user_id = data.get("User", {}).get("Id")
+        if access_token and user_id:
+            logger.debug("  -> [自动登录] 成功，已获取到临时的 AccessToken。")
+            return access_token, user_id
+        else:
+            logger.error("  -> [自动登录] 登录 Emby 成功，但响应中未找到 AccessToken 或 UserId。")
+            return None, None
+    except Exception as e:
+        logger.error(f"  -> [自动登录] 模拟登录 Emby 失败: {e}")
+        return None, None
 # ✨✨✨ 快速获取指定类型的项目总数，不获取项目本身 ✨✨✨
 def get_item_count(base_url: str, api_key: str, user_id: Optional[str], item_type: str, parent_id: Optional[str] = None) -> Optional[int]:
     """
@@ -40,7 +76,6 @@ def get_item_count(base_url: str, api_key: str, user_id: Optional[str], item_typ
         "Limit": 0 # ★★★ 核心：Limit=0 只返回元数据（包括总数），不返回任何项目，速度极快
     }
     
-    # ★★★ 新增的核心逻辑：如果提供了父ID，就加入查询参数 ★★★
     if parent_id:
         params["ParentId"] = parent_id
         logger.debug(f"正在获取父级 {parent_id} 下 {item_type} 的总数...")
@@ -48,7 +83,9 @@ def get_item_count(base_url: str, api_key: str, user_id: Optional[str], item_typ
         logger.debug(f"正在获取所有 {item_type} 的总数...")
             
     try:
-        response = requests.get(api_url, params=params, timeout=15)
+        # ★★★ 核心修改 3/3: 在所有 requests 调用中动态获取超时时间 ★★★
+        api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+        response = requests.get(api_url, params=params, timeout=api_timeout)
         response.raise_for_status()
         data = response.json()
         
@@ -71,25 +108,22 @@ def get_emby_item_details(item_id: str, emby_server_url: str, emby_api_key: str,
 
     url = f"{emby_server_url.rstrip('/')}/Users/{user_id}/Items/{item_id}"
 
-    # 2. 动态决定 Fields 参数的值
     if fields:
         fields_to_request = fields
     else:
-        fields_to_request = "ProviderIds,People,Path,OriginalTitle,DateCreated,PremiereDate,ProductionYear,ChildCount,RecursiveItemCount,Overview,CommunityRating,OfficialRating,Genres,Studios,Taglines"
+        fields_to_request = "ProviderIds,People,Path,OriginalTitle,DateCreated,PremiereDate,ProductionYear,ChildCount,RecursiveItemCount,Overview,CommunityRating,OfficialRating,Genres,Studios,Taglines,MediaStreams"
 
     params = {
         "api_key": emby_api_key,
         "Fields": fields_to_request
     }
     
-    # ✨✨✨ 新增：告诉 Emby 返回的 People 对象里要包含哪些字段 ✨✨✨
-    # 这是一个更可靠的方法
     params["PersonFields"] = "ImageTags,ProviderIds"
     
-    # --- 函数的其余部分保持不变 ---
-
     try:
-        response = requests.get(url, params=params, timeout=15)
+        # ★★★ 核心修改: 动态获取超时时间 ★★★
+        api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+        response = requests.get(url, params=params, timeout=api_timeout)
 
         if response.status_code != 200:
             logger.trace(f"响应头部: {response.headers}")
@@ -128,40 +162,30 @@ def get_emby_item_details(item_id: str, emby_server_url: str, emby_api_key: str,
         return None
 # ✨✨✨ 精确清除 Person 的某个 Provider ID ✨✨✨
 def clear_emby_person_provider_id(person_id: str, provider_key_to_clear: str, emby_server_url: str, emby_api_key: str, user_id: str) -> bool:
-    """
-    【V1 - 精确手术刀】
-    精确地从一个 Emby Person 条目中移除一个指定的 Provider ID。
-    例如: provider_key_to_clear = "Tmdb" 或 "Douban"。
-    """
     if not all([person_id, provider_key_to_clear, emby_server_url, emby_api_key, user_id]):
         logger.error("clear_emby_person_provider_id: 参数不足。")
         return False
 
     try:
-        # 步骤 1: 获取 Person 的当前完整信息
         person_details = get_emby_item_details(person_id, emby_server_url, emby_api_key, user_id, fields="ProviderIds,Name")
         if not person_details:
             logger.warning(f"无法获取 Person {person_id} 的详情，跳过清除 Provider ID 操作。")
-            return False # 视为非失败，因为对象可能已不存在
+            return False
 
         person_name = person_details.get("Name", f"ID:{person_id}")
         current_provider_ids = person_details.get("ProviderIds", {})
 
-        # 步骤 2: 检查是否需要清除
         if provider_key_to_clear not in current_provider_ids:
             logger.trace(f"Person '{person_name}' ({person_id}) 已不包含 '{provider_key_to_clear}' ID，无需操作。")
-            return True # 已经清除了，视为成功
+            return True
 
-        # 步骤 3: 构造只包含修改后 ProviderIds 的更新载荷
         logger.debug(f"  -> 正在从 Person '{person_name}' ({person_id}) 的 ProviderIds 中移除 '{provider_key_to_clear}'...")
         
         updated_provider_ids = current_provider_ids.copy()
         del updated_provider_ids[provider_key_to_clear]
         
-        # 使用一个只包含我们要修改的字段的字典
         update_payload = {"ProviderIds": updated_provider_ids}
 
-        # 步骤 4: 调用通用的更新函数来执行更新
         return update_person_details(person_id, update_payload, emby_server_url, emby_api_key, user_id)
 
     except Exception as e:
@@ -169,40 +193,35 @@ def clear_emby_person_provider_id(person_id: str, provider_key_to_clear: str, em
         return False
 # ✨✨✨ 更新一个 Person 条目本身的信息 ✨✨✨
 def update_person_details(person_id: str, new_data: Dict[str, Any], emby_server_url: str, emby_api_key: str, user_id: str) -> bool:
-    """
-    更新一个 Person 条目本身的信息 (例如，只更新名字)。
-    使用 /Users/{UserId}/Items/{ItemId} 端点，因为它对所有 Item 类型都更可靠。
-    """
-    if not all([person_id, new_data, emby_server_url, emby_api_key, user_id]): # <--- 新增 user_id 检查
+    if not all([person_id, new_data, emby_server_url, emby_api_key, user_id]):
         logger.error("update_person_details: 参数不足 (需要 user_id)。")
         return False
 
-    # ✨✨✨ 关键修改：使用包含 UserID 的端点 ✨✨✨
     api_url = f"{emby_server_url.rstrip('/')}/Users/{user_id}/Items/{person_id}"
     params = {"api_key": emby_api_key}
     
     try:
-        # 步骤 1: 获取 Person 的当前完整信息
+        # ★★★ 核心修改: 动态获取超时时间 ★★★
+        api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
         logger.trace(f"准备获取 Person 详情 (ID: {person_id}, UserID: {user_id}) at {api_url}")
-        response_get = requests.get(api_url, params=params, timeout=10)
+        response_get = requests.get(api_url, params=params, timeout=api_timeout)
         response_get.raise_for_status()
         person_to_update = response_get.json()
     except requests.exceptions.RequestException as e:
         logger.error(f"更新Person前获取其详情失败 (ID: {person_id}, UserID: {user_id}): {e}")
         return False
 
-    # 步骤 2: 将新数据合并到获取到的对象中
     for key, value in new_data.items():
         person_to_update[key] = value
     
-    # 步骤 3: 使用 POST /Items/{ItemId} (不带UserID) 来更新
-    # 更新操作通常是全局的，不针对特定用户
     update_url = f"{emby_server_url.rstrip('/')}/Items/{person_id}"
     headers = {'Content-Type': 'application/json'}
 
     logger.trace(f"  -> 准备更新 Person (ID: {person_id}) 的信息，新数据: {new_data}")
     try:
-        response_post = requests.post(update_url, json=person_to_update, headers=headers, params=params, timeout=15)
+        # ★★★ 核心修改: 动态获取超时时间 ★★★
+        api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+        response_post = requests.post(update_url, json=person_to_update, headers=headers, params=params, timeout=api_timeout)
         response_post.raise_for_status()
         logger.trace(f"  -> 成功更新 Person (ID: {person_id}) 的信息。")
         return True
@@ -214,12 +233,6 @@ def update_emby_item_cast(item_id: str, new_cast_list_for_handler: List[Dict[str
                           emby_server_url: str, emby_api_key: str, user_id: str,
                           new_rating: Optional[float] = None
                           ) -> bool:
-    """
-    【V-Final Optimized - 最终优化版】
-    职责单一化：此函数的核心职责是更新媒体与演员的“链接关系”。
-    - 对于已存在的演员，只发送其Emby ID。
-    - 对于新演员，发送其ProviderIds以帮助Emby创建更完整的条目。
-    """
     if not all([item_id, emby_server_url, emby_api_key, user_id]):
         logger.error(
             "update_emby_item_cast: 参数不足：缺少ItemID、服务器URL、API Key或UserID。")
@@ -227,14 +240,15 @@ def update_emby_item_cast(item_id: str, new_cast_list_for_handler: List[Dict[str
     if new_cast_list_for_handler is None:
         new_cast_list_for_handler = []
 
-    # 步骤1: 获取当前项目的完整信息 (逻辑不变)
     current_item_url = f"{emby_server_url.rstrip('/')}/Users/{user_id}/Items/{item_id}"
     params_get = {"api_key": emby_api_key}
     item_to_update: Optional[Dict[str, Any]] = None
     item_name_for_log = f"ID:{item_id}"
     try:
+        # ★★★ 核心修改: 动态获取超时时间 ★★★
+        api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
         response_get = requests.get(
-            current_item_url, params=params_get, timeout=15)
+            current_item_url, params=params_get, timeout=api_timeout)
         response_get.raise_for_status()
         item_to_update = response_get.json()
         item_name_for_log = item_to_update.get("Name", f"ID:{item_id}")
@@ -246,7 +260,6 @@ def update_emby_item_cast(item_id: str, new_cast_list_for_handler: List[Dict[str
     if not item_to_update:
         return False
 
-    # 更新评分的逻辑 (逻辑不变)
     if new_rating is not None:
         try:
             rating_float = float(new_rating)
@@ -256,9 +269,6 @@ def update_emby_item_cast(item_id: str, new_cast_list_for_handler: List[Dict[str
         except (ValueError, TypeError):
             pass
 
-    # ======================================================================
-    # ★★★ 核心修改：构建新的 People 列表，逻辑更清晰 ★★★
-    # ======================================================================
     formatted_people_for_emby: List[Dict[str, Any]] = []
     for actor_entry in new_cast_list_for_handler:
         actor_name = actor_entry.get("name")
@@ -273,13 +283,10 @@ def update_emby_item_cast(item_id: str, new_cast_list_for_handler: List[Dict[str
 
         emby_person_id = actor_entry.get("emby_person_id")
 
-        # --- 策略分流 ---
         if emby_person_id and str(emby_person_id).strip():
-            # 1. 对于已存在的演员：只提供ID，用于链接。
             person_obj["Id"] = str(emby_person_id).strip()
             logger.trace(f"  -> 链接现有演员 '{person_obj['Name']}' (ID: {person_obj['Id']})")
         else:
-            # 2. 对于新演员：提供ProviderIds，帮助Emby创建。
             logger.trace(f"  -> 添加新演员 '{person_obj['Name']}'")
             provider_ids = actor_entry.get("provider_ids")
             if isinstance(provider_ids, dict) and provider_ids:
@@ -292,20 +299,20 @@ def update_emby_item_cast(item_id: str, new_cast_list_for_handler: List[Dict[str
 
     item_to_update["People"] = formatted_people_for_emby
 
-    # 处理锁字段的逻辑 (逻辑不变)
     if "LockedFields" in item_to_update and "Cast" in item_to_update.get("LockedFields", []):
         current_locked_fields = set(item_to_update["LockedFields"])
         current_locked_fields.remove("Cast")
         item_to_update["LockedFields"] = list(current_locked_fields)
 
-    # 步骤3: POST 更新项目信息 (逻辑不变)
     update_url = f"{emby_server_url.rstrip('/')}/Items/{item_id}"
     headers = {'Content-Type': 'application/json'}
     params_post = {"api_key": emby_api_key}
 
     try:
+        # ★★★ 核心修改: 动态获取超时时间 ★★★
+        api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
         response_post = requests.post(
-            update_url, json=item_to_update, headers=headers, params=params_post, timeout=20)
+            update_url, json=item_to_update, headers=headers, params=params_post, timeout=api_timeout)
         response_post.raise_for_status()
         logger.trace(f"成功更新Emby项目 {item_name_for_log} 的演员信息。")
         return True
@@ -314,10 +321,6 @@ def update_emby_item_cast(item_id: str, new_cast_list_for_handler: List[Dict[str
         return False
 # ✨✨✨ 获取 Emby 用户可见媒体库列表 ✨✨✨
 def get_emby_libraries(emby_server_url, emby_api_key, user_id):
-    """
-    【最终版】从Emby服务器获取指定用户可见的所有媒体库和合集 (Views)。
-    返回从Emby API获取的原始、完整的 "Items" 列表，以供调用者灵活使用。
-    """
     if not all([emby_server_url, emby_api_key, user_id]):
         logger.error("get_emby_libraries: 缺少必要的Emby配置信息。")
         return None
@@ -326,12 +329,13 @@ def get_emby_libraries(emby_server_url, emby_api_key, user_id):
     params = {'api_key': emby_api_key}
     
     try:
+        # ★★★ 核心修改: 动态获取超时时间 ★★★
+        api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
         logger.trace(f"  -> 正在从 {target_url} 获取媒体库和合集...")
-        response = requests.get(target_url, params=params, timeout=15)
+        response = requests.get(target_url, params=params, timeout=api_timeout)
         response.raise_for_status()
         data = response.json()
         
-        # ★★★ 核心修改：返回原始的、完整的Items列表 ★★★
         items = data.get('Items', [])
         logger.trace(f"  -> 成功获取到 {len(items)} 个媒体库/合集。")
         return items
@@ -351,17 +355,16 @@ def get_emby_library_items(
     library_ids: Optional[List[str]] = None,
     search_term: Optional[str] = None,
     library_name_map: Optional[Dict[str, str]] = None,
-    fields: Optional[str] = None
+    fields: Optional[str] = None,
+    force_user_endpoint: bool = False
 ) -> Optional[List[Dict[str, Any]]]:
-    """
-    【V3 - 安静且信息补充版】
-    获取项目，并为每个项目添加来源库ID，不再打印每个库的日志。
-    """
     if not base_url or not api_key:
         logger.error("get_emby_library_items: base_url 或 api_key 未提供。")
         return None
 
-    # --- 搜索模式 (保持不变) ---
+    # ★★★ 核心修改: 在函数开头一次性获取超时时间 ★★★
+    api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+
     if search_term and search_term.strip():
         logger.info(f"进入搜索模式，关键词: '{search_term}'")
         api_url = f"{base_url.rstrip('/')}/Users/{user_id}/Items"
@@ -374,7 +377,7 @@ def get_emby_library_items(
             "Limit": 100
         }
         try:
-            response = requests.get(api_url, params=params, timeout=20)
+            response = requests.get(api_url, params=params, timeout=api_timeout)
             response.raise_for_status()
             items = response.json().get("Items", [])
             logger.info(f"搜索到 {len(items)} 个匹配项。")
@@ -383,7 +386,6 @@ def get_emby_library_items(
             logger.error(f"搜索 Emby 时发生网络错误: {e}")
             return None
 
-    # --- 非搜索模式 ---
     if not library_ids:
         return []
 
@@ -395,27 +397,27 @@ def get_emby_library_items(
         library_name = library_name_map.get(lib_id, lib_id) if library_name_map else lib_id
         
         try:
-            api_url = f"{base_url.rstrip('/')}/Items"
-            
-            # ★★★ 核心修复：在这里决定 Fields 参数的值 ★★★
-            # 如果调用者提供了 fields，就用它；否则，使用我们原来的默认值。
-            fields_to_request = fields if fields else "Id,Name,Type,ProductionYear,ProviderIds,Path,OriginalTitle,DateCreated,PremiereDate,ChildCount,RecursiveItemCount,Overview,CommunityRating,OfficialRating,Genres,Studios,Taglines,People,ProductionLocations"
+            fields_to_request = fields if fields else "ProviderIds,Name,Type,MediaStreams,ChildCount,Path,OriginalTitle"
 
             params = {
                 "api_key": api_key, "Recursive": "true", "ParentId": lib_id,
-                "Fields": fields_to_request, # ★★★ 使用我们新决定的值 ★★★
+                "Fields": fields_to_request,
             }
             if media_type_filter:
                 params["IncludeItemTypes"] = media_type_filter
             else:
                 params["IncludeItemTypes"] = "Movie,Series,Video"
 
-            if user_id:
-                params["UserId"] = user_id
+            if force_user_endpoint and user_id:
+                api_url = f"{base_url.rstrip('/')}/Users/{user_id}/Items"
+            else:
+                api_url = f"{base_url.rstrip('/')}/Items"
+                if user_id:
+                    params["UserId"] = user_id
 
-            logger.trace(f"Requesting items from library '{library_name}' (ID: {lib_id}).")
+            logger.trace(f"Requesting items from library '{library_name}' (ID: {lib_id}) using URL: {api_url}.")
             
-            response = requests.get(api_url, params=params, timeout=30)
+            response = requests.get(api_url, params=params, timeout=api_timeout)
             response.raise_for_status()
             items_in_lib = response.json().get("Items", [])
             
@@ -432,14 +434,10 @@ def get_emby_library_items(
     media_type_in_chinese = ""
 
     if media_type_filter:
-        # 分割字符串，例如 "Movie,Series" -> ["Movie", "Series"]
         types = media_type_filter.split(',')
-        # 为每个类型查找翻译，如果找不到就用原名
         translated_types = [type_to_chinese.get(t, t) for t in types]
-        # 将翻译后的列表组合成一个字符串，例如 ["电影", "电视剧"] -> "电影、电视剧"
         media_type_in_chinese = "、".join(translated_types)
     else:
-        # 如果 media_type_filter 未提供，则为“所有”
         media_type_in_chinese = '所有'
 
     logger.debug(f"  -> 总共从 {len(library_ids)} 个选定库中获取到 {len(all_items_from_selected_libraries)} 个 {media_type_in_chinese} 项目。")
@@ -449,24 +447,22 @@ def get_emby_library_items(
 def refresh_emby_item_metadata(item_emby_id: str,
                                emby_server_url: str,
                                emby_api_key: str,
-                               user_id_for_ops: str, # ★ 改名，表示所有操作都用这个ID
-                               lock_fields: Optional[List[str]] = None, # ★ 新增：要锁定的字段列表
+                               user_id_for_ops: str,
+                               lock_fields: Optional[List[str]] = None,
                                replace_all_metadata_param: bool = False,
                                replace_all_images_param: bool = False,
                                item_name_for_log: Optional[str] = None
                                ) -> bool:
-    """
-    【V-Locksmith - 锁匠最终版】
-    一个全能的刷新函数，集成了自动解锁、上锁和刷新的完整流程。
-    """
     if not all([item_emby_id, emby_server_url, emby_api_key, user_id_for_ops]):
         logger.error("刷新Emby元数据参数不足：缺少ItemID、服务器URL、API Key或UserID。")
         return False
     
     log_identifier = f"'{item_name_for_log}'" if item_name_for_log else f"ItemID: {item_emby_id}"
     
+    # ★★★ 核心修改: 在函数开头一次性获取超时时间 ★★★
+    api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+
     try:
-        # --- 步骤 1: 获取当前项目详情，这是所有操作的基础 ---
         logger.debug(f"  -> 正在为 {log_identifier} 获取当前详情...")
         item_data = get_emby_item_details(item_emby_id, emby_server_url, emby_api_key, user_id_for_ops)
         if not item_data:
@@ -475,7 +471,6 @@ def refresh_emby_item_metadata(item_emby_id: str,
 
         item_needs_update = False
         
-        # --- 步骤 2: 解锁逻辑 (如果需要强制替换元数据) ---
         if replace_all_metadata_param:
             logger.debug(f"  -> 检测到 ReplaceAllMetadata=True，执行解锁...")
             if item_data.get("LockData") is True:
@@ -485,7 +480,6 @@ def refresh_emby_item_metadata(item_emby_id: str,
                 item_data["LockedFields"] = []
                 item_needs_update = True
         
-        # --- 步骤 3: 上锁逻辑 (如果调用者指定了要锁定的字段) ---
         if lock_fields:
             logger.debug(f"  -> 检测到需要锁定字段: {lock_fields}...")
             current_locked_fields = set(item_data.get("LockedFields", []))
@@ -498,13 +492,12 @@ def refresh_emby_item_metadata(item_emby_id: str,
                 item_data["LockedFields"] = list(current_locked_fields)
                 item_needs_update = True
 
-        # --- 步骤 4: 如果有任何变更，一次性 POST 回去 ---
         if item_needs_update:
             logger.debug(f"  -> 正在为 {log_identifier} 提交锁状态更新...")
             update_url = f"{emby_server_url.rstrip('/')}/Items/{item_emby_id}"
             update_params = {"api_key": emby_api_key}
             headers = {'Content-Type': 'application/json'}
-            update_response = requests.post(update_url, json=item_data, headers=headers, params=update_params, timeout=15)
+            update_response = requests.post(update_url, json=item_data, headers=headers, params=update_params, timeout=api_timeout)
             update_response.raise_for_status()
             logger.debug(f"  -> 成功更新 {log_identifier} 的锁状态。")
         else:
@@ -513,12 +506,11 @@ def refresh_emby_item_metadata(item_emby_id: str,
     except Exception as e:
         logger.warning(f"  -> 在刷新前更新锁状态时失败: {e}。刷新将继续，但可能受影响。")
 
-    # --- 步骤 5: 无论如何，都执行最终的刷新操作 ---
     logger.debug(f"  -> 正在为 {log_identifier} 发送最终的刷新请求...")
     refresh_url = f"{emby_server_url.rstrip('/')}/Items/{item_emby_id}/Refresh"
     params = {
         "api_key": emby_api_key,
-        "Recursive": str(item_data.get("Type") == "Series").lower(), # 剧集自动递归
+        "Recursive": str(item_data.get("Type") == "Series").lower(),
         "MetadataRefreshMode": "Default",
         "ImageRefreshMode": "Default",
         "ReplaceAllMetadata": str(replace_all_metadata_param).lower(),
@@ -526,7 +518,7 @@ def refresh_emby_item_metadata(item_emby_id: str,
     }
     
     try:
-        response = requests.post(refresh_url, params=params, timeout=30)
+        response = requests.post(refresh_url, params=params, timeout=api_timeout)
         if response.status_code == 204:
             logger.info(f"  -> 刷新请求已成功发送给 {log_identifier}。")
             return True
@@ -537,75 +529,125 @@ def refresh_emby_item_metadata(item_emby_id: str,
         logger.error(f"  - 刷新请求时发生网络错误: {e}")
         return False
 # ✨✨✨ 分批次地从 Emby 获取所有 Person 条目 ✨✨✨
-def get_all_persons_from_emby(base_url: str, api_key: str, user_id: Optional[str], stop_event: Optional[threading.Event] = None) -> Generator[List[Dict[str, Any]], None, None]:
+def get_all_persons_from_emby(
+    base_url: str, 
+    api_key: str, 
+    user_id: Optional[str], 
+    stop_event: Optional[threading.Event] = None
+) -> Generator[List[Dict[str, Any]], None, None]:
     """
-    【健壮修复版】分批次地从 Emby 获取所有 Person 条目。
-    - 改用更稳定的 /Users/{UserId}/Items endpoint。
-    - 移除了不可靠的 `len(items) < batch_size` 判断。
+    分批次获取 Emby 中的 Person (演员) 项目。
+
+    此函数会自动检查全局配置。如果用户在配置中指定了要处理的媒体库，
+    则只获取这些媒体库关联的演员；否则，将获取服务器上的所有演员。
     """
     if not user_id:
         logger.error("获取所有演员需要提供 User ID，但未提供。任务中止。")
         return
 
-    # ★★★ 核心修复 1: 改用更稳定、官方推荐的 Endpoint ★★★
-    api_url = f"{base_url.rstrip('/')}/Users/{user_id}/Items"
-    
-    headers = {
-        "X-Emby-Token": api_key,
-        "Accept": "application/json",
-    }
-    
-    params = {
-        "Recursive": "true",
-        "IncludeItemTypes": "Person",
-        "Fields": "ProviderIds,Name", # 确保字段正确
-    }
+    # ▼▼▼ 核心逻辑：函数自己检查全局配置，决定行为模式 ▼▼▼
+    library_ids = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_LIBRARIES_TO_PROCESS)
 
-    start_index = 0
-    batch_size = 5000 # 使用更稳定的 endpoint，可以适当调大批次大小，提高效率
+    # --- 模式一：未配置特定媒体库，执行全量扫描 ---
+    if not library_ids:
+        logger.info("  -> 未在配置中指定媒体库，将从整个 Emby 服务器分批获取所有演员数据...")
+        api_url = f"{base_url.rstrip('/')}/Users/{user_id}/Items"
+        headers = {"X-Emby-Token": api_key, "Accept": "application/json"}
+        params = {
+            "Recursive": "true",
+            "IncludeItemTypes": "Person",
+            "Fields": "ProviderIds,Name",
+        }
+        start_index = 0
+        batch_size = 5000
+        api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
 
-    logger.info(f"  -> 开始从 Emby 分批次获取所有演员数据 (每批: {batch_size})...")
-    
-    while True:
+        while True:
+            if stop_event and stop_event.is_set():
+                logger.info("Emby Person 获取任务被中止。")
+                return
+
+            request_params = params.copy()
+            request_params["StartIndex"] = start_index
+            request_params["Limit"] = batch_size
+            logger.debug(f"  -> 获取 Person 批次: StartIndex={start_index}, Limit={batch_size}")
+
+            try:
+                response = requests.get(api_url, headers=headers, params=request_params, timeout=api_timeout)
+                response.raise_for_status()
+                data = response.json()
+                items = data.get("Items", [])
+                
+                if not items:
+                    logger.trace("API 返回空列表，已获取所有 Person 数据。")
+                    break
+
+                yield items
+                start_index += len(items)
+                time.sleep(0.1)
+            except requests.exceptions.RequestException as e:
+                logger.error(f"请求 Emby API 失败 (批次 StartIndex={start_index}): {e}", exc_info=True)
+                return
+        return
+
+    # --- 模式二：已配置特定媒体库，执行精确扫描 ---
+    logger.info(f"  -> 检测到配置了 {len(library_ids)} 个媒体库，将只获取这些库中的演员数据...")
+
+    # 步骤 1: 获取指定库中所有媒体项目，并请求 'People' 字段
+    media_items = get_emby_library_items(
+        base_url=base_url,
+        api_key=api_key,
+        user_id=user_id,
+        library_ids=library_ids,
+        media_type_filter="Movie,Series",
+        fields="People"
+    )
+
+    if media_items is None:
+        logger.error("无法从指定的媒体库中获取媒体项，无法继续获取演员信息。")
+        return
+    if not media_items:
+        logger.info("指定的媒体库中没有找到任何媒体项。")
+        yield []
+        return
+
+    # 步骤 2: 从媒体项目中提取所有唯一的演员ID
+    unique_person_ids = set()
+    for item in media_items:
         if stop_event and stop_event.is_set():
-            logger.info("Emby Person 获取任务被中止。")
+            logger.info("在提取演员ID阶段，任务被中止。")
+            return
+        for person in item.get("People", []):
+            if person_id := person.get("Id"):
+                unique_person_ids.add(person_id)
+
+    person_ids_to_fetch = list(unique_person_ids)
+    logger.info(f"  -> 从媒体项目中识别出 {len(person_ids_to_fetch)} 位独立演员。")
+
+    if not person_ids_to_fetch:
+        yield []
+        return
+
+    # 步骤 3: 使用 get_emby_items_by_id 分批获取这些演员的完整信息
+    batch_size = 500
+    for i in range(0, len(person_ids_to_fetch), batch_size):
+        if stop_event and stop_event.is_set():
+            logger.info("在分批获取演员详情阶段，任务被中止。")
             return
 
-        # 将分页参数加入请求
-        request_params = params.copy()
-        request_params["StartIndex"] = start_index
-        request_params["Limit"] = batch_size
+        batch_ids = person_ids_to_fetch[i:i + batch_size]
+        logger.debug(f"  -> 正在获取批次 {i//batch_size + 1} 的演员详情 ({len(batch_ids)} 个)...")
+
+        person_details_batch = get_emby_items_by_id(
+            base_url=base_url,
+            api_key=api_key,
+            user_id=user_id,
+            item_ids=batch_ids,
+            fields="ProviderIds,Name"
+        )
         
-        logger.debug(f"  -> 获取 Person 批次: StartIndex={start_index}, Limit={batch_size}")
-        
-        try:
-            # 注意：使用 headers 传递 token，而不是作为 URL 参数
-            response = requests.get(api_url, headers=headers, params=request_params, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            items = data.get("Items", [])
-            
-            # ★★★ 核心修复 2: 只保留这一个最可靠的退出条件 ★★★
-            if not items:
-                logger.trace("API 返回空列表，已获取所有 Person 数据。")
-                break # 没有更多数据了，正常结束循环
-
-            # 使用 yield 返回这一批数据
-            yield items
-            
-            # ★★★ 核心修复 3: 移除不可靠的 len(items) < batch_size 判断 ★★★
-            # 无论返回多少，都用实际返回的数量来增加索引，这是最安全的方式
-            start_index += len(items)
-            
-            # 稍微延时，避免请求过于频繁
-            time.sleep(0.1) 
-
-        except requests.exceptions.RequestException as e:
-            logger.error(f"请求 Emby API 失败 (批次 StartIndex={start_index}): {e}", exc_info=True)
-            return
-        except Exception as e:
-            logger.error(f"处理 Emby 响应时发生未知错误 (批次 StartIndex={start_index}): {e}", exc_info=True)
-            return
+        if person_details_batch:
+            yield person_details_batch
 # ✨✨✨ 获取剧集下所有剧集的函数 ✨✨✨
 def get_series_children(
     series_id: str,
@@ -616,9 +658,6 @@ def get_series_children(
     include_item_types: str = "Season,Episode",
     fields: str = "Id,Name,ParentIndexNumber,IndexNumber,Overview"
 ) -> Optional[List[Dict[str, Any]]]:
-    """
-    【V2 - 灵活版】获取指定剧集下的子项目，可以指定类型。
-    """
     log_identifier = f"'{series_name_for_log}' (ID: {series_id})" if series_name_for_log else f"ID {series_id}"
 
     if not all([series_id, base_url, api_key, user_id]):
@@ -629,7 +668,6 @@ def get_series_children(
     params = {
         "api_key": api_key,
         "ParentId": series_id,
-        # ★★★★★★★★★★★★★★★ 使用新参数 ★★★★★★★★★★★★★★★
         "IncludeItemTypes": include_item_types,
         "Recursive": "true",
         "Fields": fields,
@@ -637,7 +675,9 @@ def get_series_children(
     
     logger.debug(f"  -> 准备获取剧集 {log_identifier} 的子项目 (类型: {include_item_types})...")
     try:
-        response = requests.get(api_url, params=params, timeout=30)
+        # ★★★ 核心修改: 动态获取超时时间 ★★★
+        api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+        response = requests.get(api_url, params=params, timeout=api_timeout)
         response.raise_for_status()
         data = response.json()
         children = data.get("Items", [])
@@ -654,22 +694,11 @@ def get_series_id_from_child_id(
     user_id: Optional[str],
     item_name: Optional[str] = None
 ) -> Optional[str]:
-    """
-    【修复版】根据子项目ID（如分集或季）获取其所属的剧集（Series）的ID。
-    Args:
-        item_id: 子项目的Emby ID。
-        base_url: Emby服务器地址。
-        api_key: Emby API Key。
-        user_id: Emby用户ID。
-        item_name: 子项目名称（可选），用于日志友好显示。
-    Returns:
-        如果找到，返回剧集的ID字符串；否则返回None。
-    """
     name_for_log = item_name or item_id
     if not all([item_id, base_url, api_key, user_id]):
         logger.error(f"get_series_id_from_child_id({name_for_log}): 缺少必要的参数。")
         return None
-    # 1. 先获取子项目本身的详情
+    
     item_details = get_emby_item_details(
         item_id=item_id,
         emby_server_url=base_url,
@@ -690,7 +719,6 @@ def get_series_id_from_child_id(
     
     series_id = item_details.get("SeriesId")
     if series_id:
-        # 获取所属剧集详情名字
         series_details = get_emby_item_details(
             item_id=series_id,
             emby_server_url=base_url,
@@ -715,9 +743,6 @@ def download_emby_image(
     max_width: Optional[int] = None,
     max_height: Optional[int] = None
 ) -> bool:
-    """
-    从 Emby 下载指定类型的图片并保存到本地。
-    """
     if not all([item_id, image_type, save_path, emby_server_url, emby_api_key]):
         logger.error("download_emby_image: 参数不足。")
         return False
@@ -730,7 +755,9 @@ def download_emby_image(
     logger.trace(f"准备下载图片: 类型='{image_type}', 从 URL: {image_url}")
     
     try:
-        with requests.get(image_url, params=params, stream=True, timeout=30) as r:
+        # ★★★ 核心修改: 动态获取超时时间 ★★★
+        api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+        with requests.get(image_url, params=params, stream=True, timeout=api_timeout) as r:
             r.raise_for_status()
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             with open(save_path, 'wb') as f:
@@ -751,27 +778,12 @@ def prepare_actor_translation_data(
     emby_url: str,
     emby_api_key: str,
     user_id: str,
-    ai_translator, # 直接传入已初始化的翻译器实例
+    ai_translator,
     stop_event: threading.Event = None
 ) -> Tuple[Dict[str, str], Dict[str, List[Dict[str, Any]]]]:
-    """
-    【数据准备版】采集、筛选并翻译演员名，然后返回待处理的数据。
-    它不再执行写回操作，而是将结果返回给调用者处理。
-
-    :param emby_url: Emby 服务器 URL。
-    :param emby_api_key: Emby API Key。
-    :param user_id: Emby 用户 ID。
-    :param ai_translator: 已初始化的AI翻译器实例。
-    :param stop_event: 用于从外部中断任务的线程事件。
-    :return: 一个元组，包含两个字典：
-             1. translation_map (Dict[str, str]): {'英文名': '中文名', ...}
-             2. name_to_persons_map (Dict[str, List[Dict[str, Any]]]): {'英文名': [演员信息字典, ...], ...}
-    """
-    # --- 阶段一：数据采集 ---
     logger.info("  -> 正在从Emby获取所有演员列表...")
     all_persons = []
     try:
-        # 使用现有的、高效的 get_all_persons_from_emby 生成器
         person_generator = get_all_persons_from_emby(
             base_url=emby_url,
             api_key=emby_api_key,
@@ -780,18 +792,16 @@ def prepare_actor_translation_data(
         )
         
         for person_batch in person_generator:
-            # 在处理每批次后检查是否需要停止
             if stop_event and stop_event.is_set():
                 logger.info("  -> 在获取演员阶段任务被中止。")
-                return {}, {} # 返回空结果
+                return {}, {}
 
             all_persons.extend(person_batch)
 
     except Exception as e:
         logger.error(f"【演员数据准备】从Emby获取演员列表时发生错误: {e}", exc_info=True)
-        return {}, {} # 发生错误时返回空结果
+        return {}, {}
 
-    # --- 阶段二：数据筛选 ---
     logger.info(f"  -> 已获取 {len(all_persons)} 位演员，正在筛选需要翻译的名字...")
     names_to_translate: Set[str] = set()
     name_to_persons_map: Dict[str, List[Dict[str, Any]]] = {}
@@ -799,7 +809,6 @@ def prepare_actor_translation_data(
     for person in all_persons:
         name = person.get("Name")
         person_id = person.get("Id")
-        # 使用 utils.contains_chinese
         if name and person_id and not utils.contains_chinese(name):
             names_to_translate.add(name)
             if name not in name_to_persons_map:
@@ -812,33 +821,26 @@ def prepare_actor_translation_data(
 
     logger.info(f"  -> 筛选出 {len(names_to_translate)} 个外文名需要翻译。")
 
-    # --- 阶段三：批量翻译 ---
     logger.info(f"  -> 正在调用AI批量翻译 {len(names_to_translate)} 个名字...")
     translation_map: Dict[str, str] = {}
     try:
-        # 调用AI翻译模块
         translation_map = ai_translator.batch_translate(
             texts=list(names_to_translate),
             mode="fast"
         )
         if not translation_map:
             logger.warning("【演员数据准备】翻译引擎未能返回任何有效结果。")
-            return {}, name_to_persons_map # 即使翻译失败，也返回映射表，避免上层出错
+            return {}, name_to_persons_map
 
     except Exception as e:
         logger.error(f"【演员数据准备】批量翻译时发生错误: {e}", exc_info=True)
-        return {}, name_to_persons_map # 翻译失败
+        return {}, name_to_persons_map
 
     logger.info("  -> 所有演员名翻译完毕，正在写回Emby数据库...")
     
-    # --- 核心修改：返回两个关键的数据结构，而不是执行写回 ---
     return translation_map, name_to_persons_map
 # --- 获取所有合集 ---
 def get_all_collections_from_emby_generic(base_url: str, api_key: str, user_id: str) -> Optional[List[Dict[str, Any]]]:
-    """
-    【新增】一个通用的、无过滤的函数，用于获取Emby中所有类型为'BoxSet'的合集。
-    这个函数是其他合集处理函数的基础。
-    """
     if not all([base_url, api_key, user_id]):
         logger.error("get_all_collections_from_emby_generic: 缺少必要的参数。")
         return None
@@ -852,7 +854,9 @@ def get_all_collections_from_emby_generic(base_url: str, api_key: str, user_id: 
     }
     
     try:
-        response = requests.get(api_url, params=params, timeout=60)
+        # ★★★ 核心修改: 动态获取超时时间 ★★★
+        api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+        response = requests.get(api_url, params=params, timeout=api_timeout)
         response.raise_for_status()
         all_collections = response.json().get("Items", [])
         logger.debug(f"  -> 成功从 Emby 获取到 {len(all_collections)} 个合集。")
@@ -862,11 +866,6 @@ def get_all_collections_from_emby_generic(base_url: str, api_key: str, user_id: 
         return None
 # ✨✨✨ 获取所有合集（过滤自建） ✨✨✨
 def get_all_collections_with_items(base_url: str, api_key: str, user_id: str) -> Optional[List[Dict[str, Any]]]:
-    """
-    【V8 - 隔离版】
-    只获取 Emby 中拥有 TMDB ID 的“常规”电影合集，
-    从而在源头上阻止“自建合集”流入常规合集的处理流程。
-    """
     if not all([base_url, api_key, user_id]):
         logger.error("get_all_collections_with_items: 缺少必要的参数。")
         return None
@@ -881,15 +880,16 @@ def get_all_collections_with_items(base_url: str, api_key: str, user_id: str) ->
         "Fields": "ProviderIds,Name,ImageTags"
     }
     
+    # ★★★ 核心修改: 在函数开头一次性获取超时时间 ★★★
+    api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+
     try:
-        response = requests.get(api_url, params=params, timeout=60)
+        response = requests.get(api_url, params=params, timeout=api_timeout)
         response.raise_for_status()
         all_collections_from_emby = response.json().get("Items", [])
         
-        # ★★★ 核心修改：在这里设置“门卫”，检查合集是否有TMDB ID ★★★
         regular_collections = []
         for coll in all_collections_from_emby:
-            # 只有当 ProviderIds 字典中存在 'Tmdb' 这个键时，才认为是常规合集
             if coll.get("ProviderIds", {}).get("Tmdb"):
                 regular_collections.append(coll)
             else:
@@ -911,7 +911,7 @@ def get_all_collections_with_items(base_url: str, api_key: str, user_id: str) ->
                 "Fields": "ProviderIds"
             }
             try:
-                children_response = requests.get(children_url, params=children_params, timeout=60)
+                children_response = requests.get(children_url, params=children_params, timeout=api_timeout)
                 children_response.raise_for_status()
                 media_in_collection = children_response.json().get("Items", [])
                 
@@ -926,7 +926,6 @@ def get_all_collections_with_items(base_url: str, api_key: str, user_id: str) ->
                 collection['ExistingMovieTmdbIds'] = []
                 return collection
 
-        # 使用过滤后的 regular_collections 列表进行后续操作
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             future_to_collection = {}
             for coll in regular_collections:
@@ -948,9 +947,6 @@ def get_all_collections_with_items(base_url: str, api_key: str, user_id: str) ->
 
 # ✨✨✨ 获取 Emby 服务器信息 (如 Server ID) ✨✨✨
 def get_emby_server_info(base_url: str, api_key: str) -> Optional[Dict[str, Any]]:
-    """
-    【新】获取 Emby 服务器的系统信息，主要用于获取 Server ID。
-    """
     if not base_url or not api_key:
         return None
     
@@ -959,7 +955,9 @@ def get_emby_server_info(base_url: str, api_key: str) -> Optional[Dict[str, Any]
     
     logger.debug("正在获取 Emby 服务器信息...")
     try:
-        response = requests.get(api_url, params=params, timeout=10)
+        # ★★★ 核心修改: 动态获取超时时间 ★★★
+        api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+        response = requests.get(api_url, params=params, timeout=api_timeout)
         response.raise_for_status()
         data = response.json()
         return data
@@ -969,10 +967,6 @@ def get_emby_server_info(base_url: str, api_key: str) -> Optional[Dict[str, Any]
 
 # --- 根据名称查找一个特定的电影合集 ---
 def get_collection_by_name(name: str, base_url: str, api_key: str, user_id: str) -> Optional[Dict[str, Any]]:
-    """
-    【V2 - 修正版】根据名称查找一个特定的电影合集 (BoxSet)，不再过滤自建合集。
-    """
-    # ★★★ 核心修复：调用新的、不过滤的通用函数 ★★★
     all_collections = get_all_collections_from_emby_generic(base_url, api_key, user_id)
     if all_collections is None:
         return None
@@ -986,11 +980,12 @@ def get_collection_by_name(name: str, base_url: str, api_key: str, user_id: str)
     return None
 
 def get_collection_members(collection_id: str, base_url: str, api_key: str, user_id: str) -> Optional[List[str]]:
-    """获取一个合集内所有媒体项的ID列表。"""
     api_url = f"{base_url.rstrip('/')}/Users/{user_id}/Items"
     params = {'api_key': api_key, 'ParentId': collection_id, 'Fields': 'Id'}
     try:
-        response = requests.get(api_url, params=params, timeout=30)
+        # ★★★ 核心修改: 动态获取超时时间 ★★★
+        api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+        response = requests.get(api_url, params=params, timeout=api_timeout)
         response.raise_for_status()
         items = response.json().get("Items", [])
         return [item['Id'] for item in items]
@@ -999,48 +994,44 @@ def get_collection_members(collection_id: str, base_url: str, api_key: str, user
         return None
 
 def add_items_to_collection(collection_id: str, item_ids: List[str], base_url: str, api_key: str) -> bool:
-    """【原子操作】只负责向合集添加项目。"""
     if not item_ids: return True
     api_url = f"{base_url.rstrip('/')}/Collections/{collection_id}/Items"
     params = {'api_key': api_key, 'Ids': ",".join(item_ids)}
     try:
-        response = requests.post(api_url, params=params, timeout=30)
+        # ★★★ 核心修改: 动态获取超时时间 ★★★
+        api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+        response = requests.post(api_url, params=params, timeout=api_timeout)
         response.raise_for_status()
         return True
     except requests.RequestException:
         return False
 
 def remove_items_from_collection(collection_id: str, item_ids: List[str], base_url: str, api_key: str) -> bool:
-    """【原子操作】只负责从合集移除项目。"""
     if not item_ids: return True
     api_url = f"{base_url.rstrip('/')}/Collections/{collection_id}/Items"
     params = {'api_key': api_key, 'Ids': ",".join(item_ids)}
     try:
-        # ★★★ 使用 DELETE 方法 ★★★
-        response = requests.delete(api_url, params=params, timeout=30)
+        # ★★★ 核心修改: 动态获取超时时间 ★★★
+        api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+        response = requests.delete(api_url, params=params, timeout=api_timeout)
         response.raise_for_status()
         return True
     except requests.RequestException:
         return False
 
 def empty_collection_in_emby(collection_id: str, base_url: str, api_key: str, user_id: str) -> bool:
-    """
-    【通过移除所有成员的方式，来间接“清空”并删除一个Emby合集。
-    """
     logger.trace(f"  -> 开始清空 Emby 合集 {collection_id} 的所有成员...")
     
-    # 步骤 1: 获取当前所有成员的ID
     member_ids = get_collection_members(collection_id, base_url, api_key, user_id)
     
     if member_ids is None:
         logger.error("  - 无法获取合集成员，清空操作中止。")
-        return False # 获取成员失败
+        return False
         
     if not member_ids:
         logger.info("  - 合集本身已为空，无需清空。")
-        return True # 合集已是空的，视为成功
+        return True
 
-    # 步骤 2: 调用我们已经验证过的 remove_items_from_collection 函数，移除所有成员
     logger.trace(f"  - 正在从合集 {collection_id} 中移除 {len(member_ids)} 个成员...")
     success = remove_items_from_collection(collection_id, member_ids, base_url, api_key)
     
@@ -1051,60 +1042,24 @@ def empty_collection_in_emby(collection_id: str, base_url: str, api_key: str, us
         
     return success
 
-def create_or_update_collection_with_tmdb_ids(
+def create_or_update_collection_with_emby_ids(
     collection_name: str, 
-    tmdb_ids: list, 
+    emby_ids_in_library: List[str],
     base_url: str, 
     api_key: str, 
-    user_id: str, 
-    library_ids: list = None,
-    # ★★★ 核心修复 1: 在函数定义中添加 item_types 参数 ★★★
-    # 默认为只处理电影，以兼容旧的调用方式
-    item_types: list = ['Movie'],
-    prefetched_emby_items: Optional[list] = None,
+    user_id: str,
     prefetched_collection_map: Optional[dict] = None
-) -> Optional[Tuple[str, List[str]]]: 
-    """
-    【V2 - 多类型兼容版】
-    通过精确计算差异，实现完美的合集同步。
-    现在可以处理包含多种媒体类型（如 Movie, Series）的合集。
-    """
-    # ★★★ 核心修复 2: 根据 item_types 列表生成日志信息 ★★★
-    type_map = {'Movie': '电影', 'Series': '电视剧'}
-    log_item_types = "、".join([type_map.get(t, t) for t in item_types])
-    logger.info(f"  -> 开始在Emby中处理名为 '{collection_name}' 的{log_item_types}合集...")
+) -> Optional[str]:
+    logger.info(f"  -> 开始在Emby中处理名为 '{collection_name}' 的合集 (基于 Emby ID)...")
     
     try:
-        # 1. & 2. 获取媒体项并计算出“应该有”的成员列表 (desired_emby_ids)
-        if prefetched_emby_items is not None:
-            all_media_items = prefetched_emby_items
-        else:
-            if not library_ids: raise ValueError("非预加载模式下必须提供 library_ids。")
-            # ★★★ 核心修复 3: media_type_filter 现在使用 item_types 列表 ★★★
-            media_type_filter_str = ",".join(item_types)
-            all_media_items = get_emby_library_items(
-                base_url=base_url, api_key=api_key, user_id=user_id, 
-                media_type_filter=media_type_filter_str, 
-                library_ids=library_ids
-            )
-        if all_media_items is None: return None
-            
-        tmdb_to_emby_id_map = {
-            item['ProviderIds']['Tmdb']: item['Id']
-            for item in all_media_items
-            # ★★★ 核心修复 4: 确保只匹配指定类型的媒体 ★★★
-            if item.get('Type') in item_types and 'ProviderIds' in item and 'Tmdb' in item['ProviderIds']
-        }
-        tmdb_ids_in_library = [str(tid) for tid in tmdb_ids if str(tid) in tmdb_to_emby_id_map]
-        desired_emby_ids = [tmdb_to_emby_id_map[tid] for tid in tmdb_ids_in_library]
+        desired_emby_ids = emby_ids_in_library
         
-        # 3. 检查合集是否存在
         collection = prefetched_collection_map.get(collection_name.lower()) if prefetched_collection_map is not None else get_collection_by_name(collection_name, base_url, api_key, user_id)
         
         emby_collection_id = None
 
         if collection:
-            # --- 更新逻辑 (保持不变) ---
             emby_collection_id = collection['Id']
             logger.info(f"  -> 发现已存在的合集 '{collection_name}' (ID: {emby_collection_id})，开始同步...")
             
@@ -1129,62 +1084,79 @@ def create_or_update_collection_with_tmdb_ids(
             if not ids_to_remove and not ids_to_add:
                 logger.info("  -> 合集内容已是最新，无需改动。")
 
-            return (emby_collection_id, tmdb_ids_in_library)
+            return emby_collection_id
         else:
-            # --- 创建逻辑 (保持不变) ---
             logger.info(f"  -> 未找到合集 '{collection_name}'，将开始创建...")
             if not desired_emby_ids:
                 logger.warning(f"合集 '{collection_name}' 在媒体库中没有任何匹配项，跳过创建。")
-                return (None, [])
+                return None
 
             api_url = f"{base_url.rstrip('/')}/Collections"
             params = {'api_key': api_key}
             payload = {'Name': collection_name, 'Ids': ",".join(desired_emby_ids)}
             
-            response = requests.post(api_url, params=params, data=payload, timeout=30)
+            # ★★★ 核心修改: 动态获取超时时间 ★★★
+            api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+            response = requests.post(api_url, params=params, data=payload, timeout=api_timeout)
             response.raise_for_status()
             new_collection_info = response.json()
             emby_collection_id = new_collection_info.get('Id')
             
-            if emby_collection_id:
-                return (emby_collection_id, tmdb_ids_in_library)
-            return None
+            return emby_collection_id
 
     except Exception as e:
         logger.error(f"处理Emby合集 '{collection_name}' 时发生未知错误: {e}", exc_info=True)
         return None
     
-# ★★★ 新增：向合集追加单个项目的函数 ★★★
+def get_emby_items_by_id(
+    base_url: str,
+    api_key: str,
+    user_id: str,
+    item_ids: List[str],
+    fields: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    if not all([base_url, api_key, user_id]) or not item_ids:
+        return []
+
+    api_url = f"{base_url.rstrip('/')}/Users/{user_id}/Items"
+    
+    params = {
+        "api_key": api_key,
+        "Ids": ",".join(item_ids),
+        "Fields": fields or "ProviderIds,UserData,Name,ProductionYear,CommunityRating,DateCreated,PremiereDate,Type,RecursiveItemCount,SortName"
+    }
+
+    try:
+        # ★★★ 核心修改: 动态获取超时时间 ★★★
+        api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+        response = requests.get(api_url, params=params, timeout=api_timeout)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("Items", [])
+    except requests.exceptions.RequestException as e:
+        logger.error(f"根据ID列表批量获取Emby项目时失败: {e}")
+        return []
+    
 def append_item_to_collection(collection_id: str, item_emby_id: str, base_url: str, api_key: str, user_id: str) -> bool:
-    """
-    【V2 - 高效修正版】向一个已存在的合集中追加单个媒体项。
-    此版本直接调用API添加单个项目，避免了获取和重传整个列表，解决了URL过长的问题。
-    :param collection_id: 目标合集的ID。
-    :param item_emby_id: 要追加的媒体项的Emby ID。
-    :return: True 如果成功，否则 False。
-    """
     logger.trace(f"准备将项目 {item_emby_id} 追加到合集 {collection_id}...")
     
-    # Emby API的 /Collections/{Id}/Items 端点本身就是追加逻辑
     api_url = f"{base_url.rstrip('/')}/Collections/{collection_id}/Items"
     
-    # ★★★ 核心修复：只发送需要添加的单个ID ★★★
     params = {
         'api_key': api_key,
-        'Ids': item_emby_id  # 只传递单个ID，URL长度绝对安全
+        'Ids': item_emby_id
     }
     
     try:
-        # 使用POST请求添加
-        response = requests.post(api_url, params=params, timeout=20)
+        # ★★★ 核心修改: 动态获取超时时间 ★★★
+        api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+        response = requests.post(api_url, params=params, timeout=api_timeout)
         response.raise_for_status()
         
-        # Emby成功后通常返回 204 No Content
         logger.trace(f"成功发送追加请求：将项目 {item_emby_id} 添加到合集 {collection_id}。")
         return True
         
     except requests.RequestException as e:
-        # 检查是否是因为项目已存在而导致的特定错误（虽然通常Emby会直接返回成功）
         if e.response is not None:
             logger.error(f"向合集 {collection_id} 追加项目 {item_emby_id} 时失败: HTTP {e.response.status_code} - {e.response.text[:200]}")
         else:
@@ -1194,18 +1166,14 @@ def append_item_to_collection(collection_id: str, item_emby_id: str, base_url: s
         logger.error(f"向合集 {collection_id} 追加项目时发生未知错误: {e}", exc_info=True)
         return False
     
-# --- 实时获取媒体库路径 ---
 def get_all_libraries_with_paths(base_url: str, api_key: str) -> List[Dict[str, Any]]:
-    """
-    【V16 - 实时获取版】
-    使用 /Library/VirtualFolders API 实时获取所有媒体库及其源文件夹(Locations)。
-    返回一个列表，每个元素包含 info 和 paths。
-    """
     logger.debug("正在实时获取所有媒体库及其源文件夹路径...")
     try:
         folders_url = f"{base_url.rstrip('/')}/Library/VirtualFolders"
         params = {"api_key": api_key}
-        response = requests.get(folders_url, params=params, timeout=20)
+        # ★★★ 核心修改: 动态获取超时时间 ★★★
+        api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+        response = requests.get(folders_url, params=params, timeout=api_timeout)
         response.raise_for_status()
         virtual_folders_data = response.json()
 
@@ -1235,28 +1203,20 @@ def get_all_libraries_with_paths(base_url: str, api_key: str) -> List[Dict[str, 
         logger.error(f"实时获取媒体库路径时发生错误: {e}", exc_info=True)
         return []
 
-# ✨✨✨ 【V16 - 最终简化版】根据项目ID找到其所属媒体库 ✨✨✨
 def get_library_root_for_item(item_id: str, base_url: str, api_key: str, user_id: str) -> Optional[Dict[str, Any]]:
-    """
-    【V16 - 最终简化版】
-    此版本依赖实时获取的路径信息进行匹配。
-    """
     logger.debug("正在为项目ID {item_id} 定位媒体库...")
     try:
-        # 步骤 1: 实时获取所有媒体库和它们的路径
         all_libraries_data = get_all_libraries_with_paths(base_url, api_key)
         if not all_libraries_data:
             logger.error("无法获取任何媒体库的路径信息，定位失败。")
             return None
 
-        # 步骤 2: 获取当前项目的文件路径
         item_details = get_emby_item_details(item_id, base_url, api_key, user_id, fields="Path")
         if not item_details or not item_details.get("Path"):
             logger.error(f"无法获取项目 {item_id} 的文件路径，定位失败。")
             return None
         item_path = item_details["Path"]
 
-        # 步骤 3: 遍历所有库，进行最长路径匹配
         best_match_library = None
         longest_match_length = 0
         for lib_data in all_libraries_data:
@@ -1278,18 +1238,12 @@ def get_library_root_for_item(item_id: str, base_url: str, api_key: str, user_id
         logger.error(f"定位媒体库时发生未知严重错误: {e}", exc_info=True)
         return None
     
-# --- 更新集简介 ---
 def update_emby_item_details(item_id: str, new_data: Dict[str, Any], emby_server_url: str, emby_api_key: str, user_id: str) -> bool:
-    """
-    【新增】“外科手术式”更新一个Emby项目的指定字段。
-    它会先获取项目的当前状态，然后只修改传入的字段，最后再写回去。
-    """
     if not all([item_id, new_data, emby_server_url, emby_api_key, user_id]):
         logger.error("update_emby_item_details: 参数不足。")
         return False
 
     try:
-        # 步骤 1: 获取项目的当前完整信息
         current_item_details = get_emby_item_details(item_id, emby_server_url, emby_api_key, user_id)
         if not current_item_details:
             logger.error(f"更新前无法获取项目 {item_id} 的详情，操作中止。")
@@ -1297,17 +1251,17 @@ def update_emby_item_details(item_id: str, new_data: Dict[str, Any], emby_server
         
         item_name_for_log = current_item_details.get("Name", f"ID:{item_id}")
 
-        # 步骤 2: 将新数据合并到获取到的对象中
         logger.debug(f"准备将以下新数据合并到 '{item_name_for_log}': {new_data}")
         item_to_update = current_item_details.copy()
         item_to_update.update(new_data)
         
-        # 步骤 3: 使用 POST /Items/{ItemId} (不带UserID) 来更新，这是最通用的更新方式
         update_url = f"{emby_server_url.rstrip('/')}/Items/{item_id}"
         params = {"api_key": emby_api_key}
         headers = {'Content-Type': 'application/json'}
 
-        response_post = requests.post(update_url, json=item_to_update, headers=headers, params=params, timeout=15)
+        # ★★★ 核心修改: 动态获取超时时间 ★★★
+        api_timeout = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+        response_post = requests.post(update_url, json=item_to_update, headers=headers, params=params, timeout=api_timeout)
         response_post.raise_for_status()
         
         logger.info(f"✅ 成功更新项目 '{item_name_for_log}' 的详情。")
@@ -1318,4 +1272,53 @@ def update_emby_item_details(item_id: str, new_data: Dict[str, Any], emby_server
         return False
     except Exception as e:
         logger.error(f"更新项目详情时发生未知错误 (ID: {item_id}): {e}", exc_info=True)
+        return False
+    
+def delete_item(item_id: str, emby_server_url: str, emby_api_key: str, user_id: str) -> bool:
+    """
+    【V-Final Frontier 终极版】
+    通过模拟管理员登录获取临时 AccessToken 来执行删除，绕过永久 API Key 的权限问题。
+    """
+    logger.warning(f"检测到删除请求，将尝试使用 [自动登录模式] 执行...")
+    
+    # 从全局配置中获取管理员登录凭证
+    cfg = config_manager.APP_CONFIG
+    admin_user = cfg.get(constants.CONFIG_OPTION_EMBY_ADMIN_USER)
+    admin_pass = cfg.get(constants.CONFIG_OPTION_EMBY_ADMIN_PASS)
+
+    if not all([admin_user, admin_pass]):
+        logger.error("删除操作失败：未在设置中配置 [Emby 管理员用户名] 和 [Emby 管理员密码]。")
+        return False
+
+    # 1. 登录获取临时令牌
+    access_token, logged_in_user_id = _get_emby_access_token(emby_server_url, admin_user, admin_pass)
+    
+    if not access_token:
+        logger.error("无法获取临时 AccessToken，删除操作中止。请检查管理员账号密码是否正确。")
+        return False
+
+    # 2. 使用临时令牌执行删除
+    # 使用最被社区推荐的 POST /Items/{Id}/Delete 接口
+    api_url = f"{emby_server_url.rstrip('/')}/Items/{item_id}/Delete"
+    
+    headers = {
+        'X-Emby-Token': access_token  # ★ 使用临时的 AccessToken
+    }
+    
+    params = {
+        'UserId': logged_in_user_id # ★ 使用登录后返回的 UserId
+    }
+    
+    api_timeout = cfg.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+    
+    try:
+        response = requests.post(api_url, headers=headers, params=params, timeout=api_timeout)
+        response.raise_for_status()
+        logger.info(f"  -> ✅ 成功使用临时令牌删除 Emby 媒体项 ID: {item_id}。")
+        return True
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"使用临时令牌删除 Emby 媒体项 ID: {item_id} 时发生HTTP错误: {e.response.status_code} - {e.response.text}")
+        return False
+    except Exception as e:
+        logger.error(f"使用临时令牌删除 Emby 媒体项 ID: {item_id} 时发生未知错误: {e}")
         return False

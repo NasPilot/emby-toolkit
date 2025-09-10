@@ -297,28 +297,22 @@ def api_update_custom_collection_media_status(collection_id):
 @login_required
 def api_subscribe_media_from_custom_collection():
     """
-    【PG JSON 兼容版】从RSS榜单合集页面手动订阅。
+    【PG JSON 兼容 & 季号精确订阅修复版】从RSS榜单合集页面手动订阅。
     """
     data = request.json
     tmdb_id = data.get('tmdb_id')
     collection_id = data.get('collection_id')
-
     if not all([tmdb_id, collection_id]):
         return jsonify({"error": "请求无效: 缺少 tmdb_id 或 collection_id"}), 400
-
     try:
         with db_handler.get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT definition_json, generated_media_info_json FROM custom_collections WHERE id = %s", (collection_id,))
             collection_record = cursor.fetchone()
-
             if not collection_record:
                 return jsonify({"error": "数据库错误: 找不到指定的合集。"}), 404
-
-            # ★★★ 核心修复 1/2：直接使用已经是字典的 definition_json 字段 ★★★
             definition = collection_record['definition_json']
             item_type_from_db = definition.get('item_type', 'Movie')
-
             authoritative_type = None
             if isinstance(item_type_from_db, list):
                 if item_type_from_db:
@@ -329,20 +323,29 @@ def api_subscribe_media_from_custom_collection():
             if authoritative_type not in ['Movie', 'Series']:
                 logger.warning(f"合集 {collection_id} 的 item_type 格式无法识别 ('{item_type_from_db}')，将默认使用 'Movie' 进行订阅。")
                 authoritative_type = 'Movie'
-
-            # ★★★ 核心修复 2/2：直接使用已经是列表的 generated_media_info_json 字段 ★★★
             media_list = collection_record.get('generated_media_info_json') or []
             target_media_item = next((item for item in media_list if str(item.get('tmdb_id')) == str(tmdb_id)), None)
-
             if not target_media_item:
                 return jsonify({"error": "订阅失败: 在该合集的媒体列表中未找到此项目。"}), 404
             
             authoritative_title = target_media_item.get('title')
             if not authoritative_title:
                 return jsonify({"error": "订阅失败: 数据库中的媒体信息不完整（缺少标题）。"}), 500
+            season_to_subscribe = target_media_item.get('season')
+
+        # --- 新增: 配额检查 ---
+        current_quota = db_handler.get_subscription_quota()
+        if current_quota <= 0:
+            logger.warning(f"API: 用户尝试订阅《{authoritative_title}》，但每日配额已用尽。")
+            return jsonify({"error": "今日订阅配额已用尽，请明天再试。"}), 429
 
         type_map = {'Movie': '电影', 'Series': '电视剧'}
-        logger.info(f"  -> 依据合集定义，使用类型 '{type_map.get(authoritative_type, authoritative_type)}' 为《{authoritative_title}》(TMDb ID: {tmdb_id}) 发起订阅...")
+        
+        # 更新日志记录，如果订阅的是带特定季号的剧集，则明确指出
+        log_message_detail = ""
+        if authoritative_type == 'Series' and season_to_subscribe is not None:
+            log_message_detail = f" 第 {season_to_subscribe} 季"
+        logger.info(f"  -> 依据合集定义，使用类型 '{type_map.get(authoritative_type, authoritative_type)}' 为《{authoritative_title}》{log_message_detail}(TMDb ID: {tmdb_id}) 发起订阅...")
         
         success = False
         if authoritative_type == 'Movie':
@@ -350,19 +353,20 @@ def api_subscribe_media_from_custom_collection():
             success = moviepilot_handler.subscribe_movie_to_moviepilot(movie_info, config_manager.APP_CONFIG)
         elif authoritative_type == 'Series':
             series_info = {"tmdb_id": tmdb_id, "title": authoritative_title}
-            success = moviepilot_handler.subscribe_series_to_moviepilot(series_info, season_number=None, config=config_manager.APP_CONFIG)
+            success = moviepilot_handler.subscribe_series_to_moviepilot(series_info, season_number=season_to_subscribe, config=config_manager.APP_CONFIG)
         
         if not success:
             return jsonify({"error": "提交到 MoviePilot 失败，请检查日志。"}), 500
 
-        target_media_item['status'] = 'subscribed'
+        # 成功后扣配额
+        db_handler.decrement_subscription_quota()
 
+        target_media_item['status'] = 'subscribed'
         with db_handler.get_db_connection() as conn:
             cursor = conn.cursor()
             new_missing_count = sum(1 for item in media_list if item.get('status') == 'missing')
             new_health_status = 'has_missing' if new_missing_count > 0 else 'ok'
             new_media_info_json = json.dumps(media_list, ensure_ascii=False)
-
             cursor.execute(
                 "UPDATE custom_collections SET generated_media_info_json = %s, health_status = %s, missing_count = %s WHERE id = %s",
                 (new_media_info_json, new_health_status, new_missing_count, collection_id)
@@ -371,7 +375,6 @@ def api_subscribe_media_from_custom_collection():
             logger.info(f"  -> 已成功更新合集 {collection_id} 中《{authoritative_title}》的状态为 '订阅中'。")
 
         return jsonify({"message": f"《{authoritative_title}》已成功提交订阅，并已更新本地状态。"}), 200
-
     except Exception as e:
         logger.error(f"处理订阅请求时发生严重错误: {e}", exc_info=True)
         return jsonify({"error": "处理订阅时发生服务器内部错误。"}), 500
@@ -426,3 +429,36 @@ def api_get_unified_ratings_for_filter():
     """为筛选器提供一个固定的、统一的分级列表。"""
     # 直接返回我们预定义好的分类列表
     return jsonify(UNIFIED_RATING_CATEGORIES)
+# --- 获取 Emby 媒体库列表 ---
+@custom_collections_bp.route('/config/emby_libraries', methods=['GET'])
+@login_required
+def api_get_emby_libraries_for_filter():
+    """为筛选器提供一个可选的 Emby 媒体库列表。"""
+    try:
+        # 从配置中获取必要的 Emby 连接信息
+        emby_url = config_manager.APP_CONFIG.get('emby_server_url')
+        emby_key = config_manager.APP_CONFIG.get('emby_api_key')
+        emby_user_id = config_manager.APP_CONFIG.get('emby_user_id')
+
+        if not all([emby_url, emby_key, emby_user_id]):
+            return jsonify({"error": "Emby 服务器配置不完整"}), 500
+
+        # 调用 emby_handler 获取原始的媒体库/视图列表
+        all_views = emby_handler.get_emby_libraries(emby_url, emby_key, emby_user_id)
+        if all_views is None:
+            return jsonify({"error": "无法从 Emby 获取媒体库列表"}), 500
+
+        # 筛选出真正的媒体库（电影、电视剧类型）并格式化为前端需要的格式
+        library_options = []
+        for view in all_views:
+            collection_type = view.get('CollectionType')
+            if collection_type in ['movies', 'tvshows']:
+                library_options.append({
+                    "label": view.get('Name'),
+                    "value": view.get('Id')
+                })
+        
+        return jsonify(library_options)
+    except Exception as e:
+        logger.error(f"获取 Emby 媒体库列表时出错: {e}", exc_info=True)
+        return jsonify({"error": "服务器内部错误"}), 500
